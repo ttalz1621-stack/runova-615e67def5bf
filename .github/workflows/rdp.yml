@@ -1,0 +1,1807 @@
+name: Runovacloud RDP
+run-name: Runovacloud ${{ inputs.session_id }} ${{ inputs.runner }} ${{ inputs.username }} ${{ inputs.minutes }}${{ inputs.root_sid != '' && format(' ~{0}', inputs.root_sid) || '' }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      session_id:
+        description: 'ID sesi (diisi otomatis oleh Runovacloud)'
+        required: true
+        type: string
+      runner:
+        description: 'Runner / versi OS'
+        required: true
+        default: windows-2022
+        type: choice
+        options:
+          - windows-2022
+          - windows-2025
+          - ubuntu-22.04
+          - ubuntu-24.04
+          - windows-11-dockur
+      username:
+        description: 'Username akses desktop'
+        required: true
+        default: runova
+        type: string
+      minutes:
+        description: 'Durasi sesi (menit, maks 330)'
+        required: true
+        default: '330'
+        type: string
+      password:
+        description: 'Password desktop (dibuat otomatis oleh Runovacloud)'
+        required: true
+        type: string
+      purpose:
+        description: 'Tujuan penggunaan'
+        required: false
+        default: ''
+        type: string
+      drive_ticket:
+        description: 'Tiket Google Drive terenkripsi (diisi otomatis oleh Runovacloud)'
+        required: false
+        default: ''
+        type: string
+      drive_api:
+        description: 'URL Runovacloud (diisi otomatis)'
+        required: false
+        default: ''
+        type: string
+      drive_folder:
+        description: 'ID folder Drive (diisi otomatis)'
+        required: false
+        default: ''
+        type: string
+      drive_mode:
+        description: 'Mode Drive: down atau sync (diisi otomatis)'
+        required: false
+        default: ''
+        type: string
+      save_settings:
+        description: 'Simpan pengaturan desktop: 1 atau kosong (diisi otomatis)'
+        required: false
+        default: ''
+        type: string
+      extra:
+        description: 'Aplikasi, ringankan desktop, Pro (base64, diisi otomatis)'
+        required: false
+        default: ''
+        type: string
+      chain:
+        description: 'Sambung otomatis: nomor sesi lanjutan, kosong = mati (diisi otomatis)'
+        required: false
+        default: ''
+        type: string
+      root_sid:
+        description: 'ID sesi awal untuk sesi lanjutan (diisi otomatis)'
+        required: false
+        default: ''
+        type: string
+      idle:
+        description: 'Hentikan otomatis bila tidak ada koneksi selama N menit, kosong = mati (diisi otomatis)'
+        required: false
+        default: ''
+        type: string
+      frp:
+        description: 'Relay frp: alamat|token|rentang port (diisi otomatis)'
+        required: false
+        default: ''
+        type: string
+      tg_ticket:
+        description: 'Tiket notifikasi Telegram terenkripsi (diisi otomatis)'
+        required: false
+        default: ''
+        type: string
+      ab_ticket:
+        description: 'Tiket perlindungan penyalahgunaan terenkripsi (diisi otomatis)'
+        required: false
+        default: ''
+        type: string
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  rdp:
+    name: RDP ${{ inputs.runner }}
+    runs-on: ${{ inputs.runner == 'windows-11-dockur' && 'ubuntu-latest' || inputs.runner }}
+    timeout-minutes: 355
+    env:
+      SID: ${{ inputs.session_id }}
+      RLABEL: ${{ inputs.runner }}
+      RUSER: ${{ inputs.username }}
+      MINUTES: ${{ inputs.minutes }}
+      RPW: ${{ inputs.password }}
+      DRIVE_TICKET: ${{ inputs.drive_ticket }}
+      DRIVE_API: ${{ inputs.drive_api }}
+      DRIVE_FOLDER: ${{ inputs.drive_folder }}
+      DRIVE_MODE: ${{ inputs.drive_mode }}
+      SAVE_SETTINGS: ${{ inputs.save_settings }}
+      EXTRA: ${{ inputs.extra }}
+      CHAIN: ${{ inputs.chain }}
+      ROOT_SID: ${{ inputs.root_sid }}
+      IDLE: ${{ inputs.idle }}
+      PURPOSE: ${{ inputs.purpose }}
+      GH_TOKEN: ${{ github.token }}
+      NGROK_AUTH_TOKEN: ${{ secrets.NGROK_AUTH_TOKEN }}
+      FRP: ${{ inputs.frp }}
+      TG_TICKET: ${{ inputs.tg_ticket }}
+      AB_TICKET: ${{ inputs.ab_ticket }}
+      RUN_STARTED: ${{ github.run_started_at }}
+    steps:
+      - name: Memeriksa input
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Write-Host "::add-mask::$($env:RPW)"
+          if ($env:FRP) { $fq = $env:FRP.Split('|'); if ($fq.Count -ge 2 -and $fq[1]) { Write-Host "::add-mask::$($fq[1])" } }
+          if ($env:RUSER -cnotmatch '^[a-z][a-z0-9_-]{2,19}$') { throw 'Username tidak valid.' }
+          if ($env:SID -cnotmatch '^[0-9a-f]{12}$') { throw 'ID sesi tidak valid.' }
+          if ($env:MINUTES -notmatch '^\d{1,3}$' -or [int]$env:MINUTES -lt 10 -or [int]$env:MINUTES -gt 330) { throw 'Durasi tidak valid.' }
+          if ($env:RPW.Length -lt 12) { throw 'Password tidak valid.' }
+          if ($env:AB_TICKET -and $env:DRIVE_API) {
+            try {
+              $ab = Invoke-RestMethod -Method Post -Uri ($env:DRIVE_API.TrimEnd('/') + '/api/abuse') -ContentType 'application/json' -Body (@{ ticket = $env:AB_TICKET; sid = $env:SID; kind = 'begin'; os = $env:RLABEL; chain = ($env:CHAIN -ne '') } | ConvertTo-Json -Compress) -TimeoutSec 20
+              if ($ab.allowed -eq $false) { $blocked = $true }
+            } catch { Write-Host 'Pemeriksaan slot dilewati.' }
+            if ($blocked) { throw 'Batas sesi aktif untuk paketmu sudah tercapai. Hentikan salah satu RDP dulu.' }
+          }
+          Write-Host 'Input valid.'
+
+      - name: Menyiapkan desktop Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $sec = ConvertTo-SecureString $env:RPW -AsPlainText -Force
+          $u = Get-LocalUser -Name $env:RUSER -ErrorAction SilentlyContinue
+          if ($u) { Set-LocalUser -Name $env:RUSER -Password $sec }
+          else { New-LocalUser -Name $env:RUSER -Password $sec -PasswordNeverExpires -AccountNeverExpires -FullName 'Runovacloud' | Out-Null }
+          Add-LocalGroupMember -Group 'Administrators' -Member $env:RUSER -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group 'Remote Desktop Users' -Member $env:RUSER -ErrorAction SilentlyContinue
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name 'fDenyTSConnections' -Value 0
+          Enable-NetFirewallRule -DisplayGroup 'Remote Desktop' -ErrorAction SilentlyContinue
+          Set-Service -Name TermService -StartupType Automatic
+          Start-Service -Name TermService -ErrorAction SilentlyContinue
+          $listening = $false
+          for ($i = 0; $i -lt 15; $i++) {
+            if (Get-NetTCPConnection -LocalPort 3389 -State Listen -ErrorAction SilentlyContinue) { $listening = $true; break }
+            Start-Sleep -Seconds 2
+          }
+          if (-not $listening) { throw 'Layanan Remote Desktop tidak aktif di port 3389.' }
+          Write-Host 'Remote Desktop Windows aktif.'
+
+      - name: Menyiapkan desktop Linux
+        if: runner.os == 'Linux' && inputs.runner != 'windows-11-dockur'
+        shell: bash
+        run: |
+          set -euo pipefail
+          # pilihan desktop dari extra.de (daftar putih): xfce (bawaan), i3, sway
+          DE=xfce
+          if [ -n "${EXTRA:-}" ]; then
+            D=$(echo "$EXTRA" | base64 -d 2>/dev/null | jq -r '.de // "xfce"' 2>/dev/null || echo xfce)
+            case "$D" in i3|sway|arch|ssh) DE="$D" ;; esac
+          fi
+          echo "Desktop Linux: $DE"
+          if [ "$DE" = ssh ]; then
+            # Mode Dev: tanpa desktop, hanya SSH (port 22). Jauh lebih cepat dari XFCE + xrdp.
+            echo "RC_MODE=ssh" >> "$GITHUB_ENV"
+            sudo apt-get update -y
+            sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends openssh-server
+            if ! id "$RUSER" >/dev/null 2>&1; then sudo useradd -m -s /bin/bash "$RUSER"; fi
+            echo "$RUSER:$RPW" | sudo chpasswd
+            sudo usermod -aG sudo "$RUSER"
+            echo "$RUSER ALL=(ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/90-runova >/dev/null
+            sudo chmod 440 /etc/sudoers.d/90-runova
+            UH="/home/$RUSER"
+            KEYS=""
+            if [ -n "${EXTRA:-}" ]; then KEYS=$(echo "$EXTRA" | base64 -d 2>/dev/null | jq -r '.keys[]? // empty' 2>/dev/null || true); fi
+            if [ -n "$KEYS" ]; then
+              sudo install -d -m 700 -o "$RUSER" -g "$RUSER" "$UH/.ssh"
+              printf '%s\n' "$KEYS" | sudo tee "$UH/.ssh/authorized_keys" >/dev/null
+              sudo chown "$RUSER:$RUSER" "$UH/.ssh/authorized_keys"
+              sudo chmod 600 "$UH/.ssh/authorized_keys"
+              echo "Kunci publik SSH dipasang."
+            fi
+            sudo mkdir -p /etc/ssh/sshd_config.d /run/sshd
+            sudo ssh-keygen -A >/dev/null 2>&1 || true
+            printf '%s\n' 'PasswordAuthentication yes' 'KbdInteractiveAuthentication no' 'PermitRootLogin no' "AllowUsers $RUSER" 'ClientAliveInterval 30' 'ClientAliveCountMax 6' 'MaxAuthTries 4' | sudo tee /etc/ssh/sshd_config.d/00-runova.conf >/dev/null
+            sudo sshd -t
+            sudo systemctl enable ssh >/dev/null 2>&1 || true
+            sudo systemctl restart ssh.socket >/dev/null 2>&1 || true
+            sudo systemctl restart ssh || sudo systemctl restart sshd
+            FP=$(ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub 2>/dev/null | awk '{print $2}' || true)
+            echo "RC_FP=$FP" >> "$GITHUB_ENV"
+            # Terminal di browser (opsional): ttyd + cloudflared quick tunnel. Gagal pasang tidak menghentikan SSH.
+            WEB=0
+            if [ "$(uname -m)" = x86_64 ] \
+              && curl -fsSL --retry 3 --max-time 120 "https://github.com/tsl0922/ttyd/releases/download/1.7.7/ttyd.x86_64" -o /tmp/ttyd \
+              && curl -fsSL --retry 3 --max-time 180 "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64" -o /tmp/cloudflared \
+              && sudo install -m 755 /tmp/ttyd /usr/local/bin/ttyd \
+              && sudo install -m 755 /tmp/cloudflared /usr/local/bin/cloudflared \
+              && /usr/local/bin/ttyd --version >/dev/null 2>&1 \
+              && /usr/local/bin/cloudflared --version >/dev/null 2>&1; then
+              WEB=1
+              H=$(/usr/local/bin/ttyd --help 2>&1 || true)
+              case "$H" in *--writable*) echo "RC_TTYD_W=-W" >> "$GITHUB_ENV" ;; esac
+            else
+              echo "Terminal web tidak tersedia (unduhan gagal), SSH tetap jalan." >&2
+            fi
+            echo "RC_WEB=$WEB" >> "$GITHUB_ENV"
+            # Port publik (Pro/Max): web di localhost:<pp> dapat link https lewat cloudflared. Hanya jalan kalau cloudflared terpasang.
+            PP=""
+            if [ "$WEB" = 1 ] && [ -n "${EXTRA:-}" ]; then
+              PP=$(echo "$EXTRA" | base64 -d 2>/dev/null | jq -r '.pp // empty' 2>/dev/null || true)
+            fi
+            case "$PP" in ''|*[!0-9]*) PP="" ;; esac
+            if [ -n "$PP" ] && { [ "$PP" -lt 1024 ] || [ "$PP" -gt 65535 ] || [ "$PP" -eq 7681 ]; }; then PP=""; fi
+            if [ -n "$PP" ]; then echo "RC_PP=$PP" >> "$GITHUB_ENV"; echo "Port publik diaktifkan untuk localhost:$PP"; fi
+            for i in $(seq 1 20); do
+              if ss -ltn | grep -q ':22 '; then echo "sshd aktif di port 22."; exit 0; fi
+              sleep 1
+            done
+            echo "sshd tidak aktif di port 22." >&2
+            exit 1
+          fi
+          PKGS="xrdp xorgxrdp dbus-x11 x11-xserver-utils xfce4-terminal"
+          case "$DE" in
+            xfce) PKGS="$PKGS xfce4" ;;
+            i3) PKGS="$PKGS i3 i3status dmenu feh xterm fonts-dejavu-core" ;;
+            sway) PKGS="$PKGS sway foot wmenu openbox wmctrl feh fonts-dejavu-core mesa-utils" ;;
+            arch) PKGS="$PKGS zstd curl" ;;
+          esac
+          sudo apt-get update -y
+          if ! sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends $PKGS; then
+            if [ "$DE" != "xfce" ]; then
+              echo "Desktop $DE gagal dipasang, memakai XFCE." >&2
+              DE=xfce
+              sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends xrdp xorgxrdp dbus-x11 x11-xserver-utils xfce4-terminal xfce4
+            else
+              exit 1
+            fi
+          fi
+          if ! id "$RUSER" >/dev/null 2>&1; then sudo useradd -m -s /bin/bash "$RUSER"; fi
+          echo "$RUSER:$RPW" | sudo chpasswd
+          sudo usermod -aG sudo "$RUSER"
+          echo "$RUSER ALL=(ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/90-runova >/dev/null
+          sudo chmod 440 /etc/sudoers.d/90-runova
+          UH="/home/$RUSER"
+          if [ "$DE" = arch ]; then
+            # Arch Linux dalam chroot: xrdp & X server tetap dari host Ubuntu, desktop XFCE-nya jalan di chroot Arch
+            cat > /tmp/rc-arch.sh <<'AS'
+          set -euo pipefail
+          U="$1"; UIDN="$2"; AR=/opt/arch
+          mkdir -p "$AR" /opt/arch-dl
+          ok=0
+          for url in https://geo.mirror.pkgbuild.com/iso/latest/archlinux-bootstrap-x86_64.tar.zst https://mirrors.kernel.org/archlinux/iso/latest/archlinux-bootstrap-x86_64.tar.zst; do
+            if curl -fsSL --retry 3 "$url" -o /opt/arch-dl/b.tar.zst; then ok=1; break; fi
+          done
+          [ "$ok" = 1 ]
+          tar --zstd -xf /opt/arch-dl/b.tar.zst -C /opt/arch-dl --numeric-owner
+          cp -a /opt/arch-dl/root.x86_64/. "$AR"/
+          rm -rf /opt/arch-dl
+          echo 'Server = https://geo.mirror.pkgbuild.com/$repo/os/$arch' > "$AR/etc/pacman.d/mirrorlist"
+          echo 'Server = https://mirrors.kernel.org/archlinux/$repo/os/$arch' >> "$AR/etc/pacman.d/mirrorlist"
+          mount --bind "$AR" "$AR"
+          mount -t proc proc "$AR/proc"
+          mount --rbind /sys "$AR/sys"
+          mount --rbind /dev "$AR/dev"
+          mount --bind /tmp "$AR/tmp"
+          mount --bind /home "$AR/home"
+          cp -L /etc/resolv.conf "$AR/etc/resolv.conf"
+          sed -i 's/^CheckSpace/#CheckSpace/' "$AR/etc/pacman.conf"
+          grep -q '^DisableSandbox' "$AR/etc/pacman.conf" || sed -i '/^\[options\]/a DisableSandbox' "$AR/etc/pacman.conf"
+          chroot "$AR" /bin/bash -euo pipefail -c 'pacman-key --init && pacman-key --populate archlinux && pacman -Syu --noconfirm --needed xfce4 xfce4-terminal dbus sudo ttf-dejavu xorg-xauth xorg-xrdb mesa'
+          chroot "$AR" useradd -M -u "$UIDN" -d "/home/$U" -s /bin/bash "$U"
+          echo "Arch Linux siap."
+          AS
+            if sudo bash /tmp/rc-arch.sh "$RUSER" "$(id -u "$RUSER")"; then
+              sudo tee "$UH/.xsession" >/dev/null <<'XS'
+          #!/bin/bash
+          export XDG_RUNTIME_DIR="/tmp/runtime-$USER"
+          mkdir -p "$XDG_RUNTIME_DIR" && chmod 700 "$XDG_RUNTIME_DIR"
+          exec sudo chroot --userspec="$USER" /opt/arch /usr/bin/env HOME="$HOME" USER="$USER" LOGNAME="$USER" DISPLAY="$DISPLAY" XAUTHORITY="${XAUTHORITY:-$HOME/.Xauthority}" XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR" LANG=C.UTF-8 /usr/bin/dbus-run-session /usr/bin/xfce4-session
+          XS
+              sudo chmod +x "$UH/.xsession"
+              DE=archdone
+            else
+              echo "Arch Linux gagal disiapkan, memakai XFCE Ubuntu." >&2
+              DE=xfce
+              sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends xfce4
+            fi
+          fi
+          case "$DE" in
+            archdone) : ;;
+            xfce) echo "xfce4-session" | sudo tee "$UH/.xsession" >/dev/null ;;
+            i3)
+              sudo mkdir -p "$UH/.config/i3"
+              [ -f /etc/i3/config ] && sudo cp /etc/i3/config "$UH/.config/i3/config"
+              # lewati wizard konfigurasi awal i3, pakai terminal & launcher yang pasti ada
+              sudo sed -i 's#^bindsym \$mod+Return exec .*#bindsym $mod+Return exec xfce4-terminal#' "$UH/.config/i3/config" || true
+              echo "exec i3" | sudo tee "$UH/.xsession" >/dev/null ;;
+            sway)
+              sudo mkdir -p "$UH/.config/sway"
+              [ -f /etc/sway/config ] && sudo cp /etc/sway/config "$UH/.config/sway/config"
+              # Sway adalah compositor Wayland: dijalankan nested di dalam sesi X11 xrdp, render software (tanpa GPU)
+              sudo tee "$UH/.xsession" >/dev/null <<'XS'
+          #!/bin/bash
+          export XDG_RUNTIME_DIR="/tmp/runtime-$USER"
+          mkdir -p "$XDG_RUNTIME_DIR" && chmod 700 "$XDG_RUNTIME_DIR"
+          export WLR_BACKENDS=x11 WLR_RENDERER=pixman WLR_NO_HARDWARE_CURSORS=1 XDG_SESSION_TYPE=wayland
+          openbox >/dev/null 2>&1 &
+          # satu-satunya jendela adalah Sway, jadi jendela aktif dibuat layar penuh agar pas dengan resolusi RDP
+          ( for i in 3 6 10 15; do sleep $i; wmctrl -r :ACTIVE: -b add,fullscreen 2>/dev/null; done ) &
+          exec dbus-run-session sway
+          XS
+              sudo chmod +x "$UH/.xsession" ;;
+          esac
+          sudo chown "$RUSER:$RUSER" "$UH/.xsession"
+          if [ -d "$UH/.config" ]; then sudo chown -R "$RUSER:$RUSER" "$UH/.config"; fi
+          sudo adduser xrdp ssl-cert >/dev/null 2>&1 || true
+          sudo systemctl enable xrdp
+          sudo systemctl restart xrdp
+          for i in $(seq 1 15); do
+            if ss -ltn | grep -q ':3389 '; then echo "xrdp aktif."; exit 0; fi
+            sleep 2
+          done
+          echo "xrdp tidak aktif di port 3389." >&2
+          exit 1
+
+      - name: Menyiapkan Windows 11 (uji coba)
+        if: inputs.runner == 'windows-11-dockur'
+        shell: bash
+        run: |
+          set -euo pipefail
+          # KVM wajib. Tanpa KVM, Windows 11 jalan lewat emulasi dan sangat patah-patah, jadi sesi dihentikan lebih awal.
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules >/dev/null
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm || true
+          if [ ! -e /dev/kvm ]; then
+            echo "::error::KVM tidak tersedia di runner ini, Windows 11 tidak bisa berjalan mulus. Pakai Windows Server."
+            exit 1
+          fi
+          # ISO dan disk Windows butuh belasan GB: bebaskan ruang dari paket bawaan runner yang tidak dipakai.
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /opt/hostedtoolcache/CodeQL /usr/local/share/boost || true
+          sudo mkdir -p /var/win && sudo chmod 777 /var/win
+          RAM=$(awk '/MemTotal/ {printf "%d", ($2/1048576)-2}' /proc/meminfo)
+          if [ "$RAM" -lt 3 ]; then RAM=3; fi
+          CORES=$(nproc)
+          echo "Windows 11 (uji coba): ${CORES} core, ${RAM}G RAM"
+          # Jalur cepat: image Windows 11 yang sudah terinstal (repo publik runova-images). Kalau tidak tersedia atau gagal dipakai,
+          # otomatis kembali ke cara lama (Dockur mengunduh ISO dan memasang Windows, 10-25 menit).
+          IMG_BASE="${RUNOVA_IMAGE_BASE:-https://github.com/rizkimuhamad123sdmyy-hash/runova-images/releases/download/win11-v1}"
+          sudo mkdir -p /var/shared && sudo chmod 777 /var/shared
+          cat > /tmp/rdpprobe.py <<'PY'
+          import socket, sys
+          s = socket.socket(); s.settimeout(5)
+          try:
+              s.connect(('127.0.0.1', 3389))
+              s.sendall(bytes.fromhex('030000130ee000000000000100080003000000'))
+              sys.exit(0 if s.recv(4)[:2] == b'\x03\x00' else 1)
+          except Exception:
+              sys.exit(1)
+          PY
+          wait_rdp() {
+            local i
+            for i in $(seq 1 "$1"); do
+              if python3 /tmp/rdpprobe.py; then return 0; fi
+              if [ -z "$(docker ps -q -f name=win)" ]; then echo "Kontainer Windows berhenti sebelum siap."; docker logs --tail 40 win || true; return 1; fi
+              sleep 10
+            done
+            return 1
+          }
+          start_fresh() {
+            docker run -d --name win \
+              --device=/dev/kvm --device=/dev/net/tun --cap-add NET_ADMIN \
+              -e VERSION=11 -e RAM_SIZE="${RAM}G" -e CPU_CORES="$CORES" -e DISK_SIZE=64G \
+              -e USERNAME="$RUSER" -e PASSWORD="$RPW" \
+              -v /var/win:/storage -p 3389:3389/tcp -p 3389:3389/udp \
+              dockurr/windows >/dev/null
+          }
+          start_image() {
+            docker run -d --name win --stop-timeout 120 \
+              --device=/dev/kvm --device=/dev/net/tun --cap-add NET_ADMIN \
+              -e VERSION=11 -e RAM_SIZE="${RAM}G" -e CPU_CORES="$CORES" -e DISK_SIZE=64G \
+              -v /var/win:/storage -v /var/shared:/shared -p 3389:3389/tcp -p 3389:3389/udp \
+              dockurr/windows >/dev/null
+          }
+          dl_one() {
+            local n
+            n=$(printf '%03d' "$1")
+            if curl -fsSL --retry 4 --retry-delay 3 -o "/mnt/dl/.$n" "$IMG_BASE/win.tar.zst.part$n"; then mv "/mnt/dl/.$n" "/mnt/dl/p$n"; else touch /mnt/dl/FAILED; fi
+          }
+          export -f dl_one
+          export IMG_BASE
+
+          MODE=fresh
+          N=""
+          # Password dan username dipakai skrip batch di Windows: hanya karakter aman yang boleh lewat jalur image.
+          if [[ "$RPW" =~ ^[A-Za-z0-9]+$ && "$RUSER" =~ ^[A-Za-z0-9_.-]+$ ]]; then
+            N=$(curl -fsSL --max-time 20 "$IMG_BASE/manifest.json" 2>/dev/null | jq -r '.parts // empty' 2>/dev/null || true)
+          fi
+          if [[ "$N" =~ ^[0-9]+$ ]] && [ "$N" -ge 1 ]; then
+            echo "Memakai image Windows 11 terinstal ($N potongan)."
+            T0=$(date +%s)
+            sudo mkdir -p /mnt/dl && sudo chmod 777 /mnt/dl && rm -rf /mnt/dl/* /mnt/dl/.[0-9]* 2>/dev/null || true
+            seq 0 $((N-1)) | xargs -P 6 -I{} bash -c 'dl_one {}' &
+            # Ekstrak berjalan bersamaan dengan unduhan: potongan dibaca berurutan begitu selesai diunduh.
+            if ( for i in $(seq 0 $((N-1))); do
+                   n=$(printf '%03d' "$i")
+                   while [ ! -f "/mnt/dl/p$n" ]; do
+                     if [ -f /mnt/dl/FAILED ]; then echo "Unduhan potongan gagal." >&2; exit 1; fi
+                     sleep 1
+                   done
+                   cat "/mnt/dl/p$n"; rm -f "/mnt/dl/p$n"
+                 done ) | zstd -d -q | sudo tar -xS -C /var/win && [ -f /var/win/data.img ]; then
+              echo "Unduh dan ekstrak image: $(( $(date +%s) - T0 )) detik."
+              MODE=image
+            else
+              echo "::warning::Image tidak bisa dipakai, kembali ke instal dari ISO."
+              pkill -f "win.tar.zst.part" || true
+              sudo rm -rf /var/win/* || true
+            fi
+            wait || true
+            sudo rm -rf /mnt/dl || true
+          else
+            echo "Image terinstal tidak tersedia atau tidak dipakai, instal dari ISO (10-25 menit)."
+          fi
+
+          if [ "$MODE" = "image" ]; then
+            T1=$(date +%s)
+            # Username dan password sesi dititipkan lewat folder bersama. Tugas RunovaInit di dalam Windows membacanya, mengatur akun,
+            # lalu menulis runova-done.txt. Sesi baru dianggap siap setelah penanda itu muncul, jadi password bawaan image tidak pernah terpakai.
+            rm -f /var/shared/runova-*.txt
+            printf '%s' "$RPW" > /var/shared/.p && mv /var/shared/.p /var/shared/runova-pass.txt
+            printf '%s' "$RUSER" > /var/shared/.u && mv /var/shared/.u /var/shared/runova-user.txt
+            chmod 666 /var/shared/runova-*.txt
+            start_image
+            ok=0
+            if wait_rdp 90; then
+              for i in $(seq 1 60); do
+                if [ -f /var/shared/runova-done.txt ]; then ok=1; break; fi
+                sleep 5
+              done
+            fi
+            if [ "$ok" = "1" ]; then
+              rm -f /var/shared/runova-done.txt
+              echo "Boot dan pengaturan akun: $(( $(date +%s) - T1 )) detik."
+            else
+              echo "::warning::Image gagal booting atau akun tidak bisa diatur, kembali ke instal dari ISO."
+              docker logs --tail 30 win || true
+              docker rm -f win >/dev/null 2>&1 || true
+              sudo rm -rf /var/win/* || true
+              rm -f /var/shared/runova-*.txt
+              MODE=fresh
+            fi
+          fi
+
+          if [ "$MODE" = "fresh" ]; then
+            start_fresh
+            # Boot pertama: Windows diunduh dan dipasang dulu (sekitar 10-25 menit). Menunggu sampai RDP menjawab.
+            if ! wait_rdp 270; then
+              echo "::error::Windows 11 belum siap setelah 45 menit."
+              docker logs --tail 40 win || true
+              exit 1
+            fi
+          fi
+          echo "Windows 11 siap di port 3389."
+
+      - name: Memasang dotfiles Dev
+        if: runner.os == 'Linux' && env.RC_MODE == 'ssh'
+        shell: bash
+        run: |
+          # Dotfiles dari profil Dev (zsh, Neovim, tmux). Tidak ada yang diisi = tidak ada yang dilakukan. Gagal tidak menghentikan sesi.
+          set +e
+          if [ -z "${EXTRA:-}" ]; then exit 0; fi
+          J=$(echo "$EXTRA" | base64 -d 2>/dev/null)
+          [ -n "$J" ] || exit 0
+          has() { echo "$J" | jq -e --arg k "$1" '.dot[$k] | strings | length > 0' >/dev/null 2>&1; }
+          put() { # kunci, tujuan relatif terhadap home
+            local dst="/home/$RUSER/$2"
+            sudo install -d -m 755 -o "$RUSER" -g "$RUSER" "$(dirname "$dst")"
+            echo "$J" | jq -r --arg k "$1" '.dot[$k] // empty' | sudo tee "$dst" >/dev/null
+            sudo chown "$RUSER:$RUSER" "$dst"
+            sudo chmod 644 "$dst"
+          }
+          PK=""
+          has zsh && PK="$PK zsh"
+          has nvim && PK="$PK neovim"
+          has tmux && PK="$PK tmux"
+          if [ -z "$PK" ]; then exit 0; fi
+          echo "Memasang dotfiles:$PK"
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends $PK || echo "Sebagian paket dotfiles gagal dipasang." >&2
+          if has zsh; then
+            if command -v zsh >/dev/null 2>&1; then
+              put zsh .zshrc
+              sudo usermod -s "$(command -v zsh)" "$RUSER" && echo "RC_SHELL=$(command -v zsh)" >> "$GITHUB_ENV"
+            else echo "zsh tidak terpasang, .zshrc dilewati." >&2; fi
+          fi
+          if has nvim; then
+            if command -v nvim >/dev/null 2>&1; then put nvim .config/nvim/init.lua; else echo "Neovim tidak terpasang, init.lua dilewati." >&2; fi
+          fi
+          if has tmux; then
+            if command -v tmux >/dev/null 2>&1; then put tmux .tmux.conf; else echo "tmux tidak terpasang, .tmux.conf dilewati." >&2; fi
+          fi
+          echo "Dotfiles selesai."
+          exit 0
+
+      - name: Menyiapkan template lingkungan
+        if: runner.os == 'Linux' && env.RC_MODE == 'ssh'
+        shell: bash
+        run: |
+          # Template lingkungan satu klik (extra.env = [{id, v}]). Id dan versi divalidasi ulang di sini; yang gagal dilewati, sesi tetap jalan.
+          set +e
+          if [ -z "${EXTRA:-}" ]; then exit 0; fi
+          J=$(echo "$EXTRA" | base64 -d 2>/dev/null)
+          LIST=$(echo "$J" | jq -r '.env[]? | "\(.id) \(.v)"' 2>/dev/null)
+          [ -n "$LIST" ] || exit 0
+          export DEBIAN_FRONTEND=noninteractive
+          APT() { sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "$@"; }
+          env_node() {
+            curl -fsSL --retry 3 "https://deb.nodesource.com/setup_$1.x" | sudo -E bash - || return 1
+            APT nodejs || return 1
+            sudo corepack enable >/dev/null 2>&1 || true
+            node --version
+          }
+          env_python() {
+            APT software-properties-common ca-certificates || return 1
+            sudo add-apt-repository -y ppa:deadsnakes/ppa || return 1
+            sudo apt-get update -y || return 1
+            APT "python$1" "python$1-venv" "python$1-dev" || return 1
+            sudo "python$1" -m ensurepip --upgrade >/dev/null 2>&1 || true
+            sudo ln -sf "/usr/bin/python$1" /usr/local/bin/python
+            printf '#!/bin/sh\nexec python%s -m pip "$@"\n' "$1" | sudo tee /usr/local/bin/pip >/dev/null
+            sudo chmod 755 /usr/local/bin/pip
+            "python$1" --version
+          }
+          env_laravel() {
+            APT software-properties-common ca-certificates unzip git curl || return 1
+            sudo add-apt-repository -y ppa:ondrej/php || return 1
+            sudo apt-get update -y || return 1
+            local v="$1" x=""
+            for e in cli mbstring xml curl zip sqlite3 mysql bcmath intl gd; do x="$x php$v-$e"; done
+            APT $x || return 1
+            sudo update-alternatives --set php "/usr/bin/php$v" >/dev/null 2>&1 || true
+            local exp act
+            exp=$(curl -fsSL --retry 3 https://composer.github.io/installer.sig) || return 1
+            curl -fsSL --retry 3 https://getcomposer.org/installer -o /tmp/composer-setup.php || return 1
+            act=$(php -r "echo hash_file('sha384', '/tmp/composer-setup.php');") || return 1
+            [ -n "$exp" ] && [ "$exp" = "$act" ] || { echo "Tanda tangan installer Composer tidak cocok." >&2; return 1; }
+            sudo php /tmp/composer-setup.php --quiet --install-dir=/usr/local/bin --filename=composer || return 1
+            rm -f /tmp/composer-setup.php
+            sudo install -d -m 755 -o "$RUSER" -g "$RUSER" "/home/$RUSER/.config" "/home/$RUSER/.config/composer"
+            sudo -u "$RUSER" -H env COMPOSER_HOME="/home/$RUSER/.config/composer" composer global require --no-interaction laravel/installer || return 1
+            sudo ln -sf "/home/$RUSER/.config/composer/vendor/bin/laravel" /usr/local/bin/laravel
+            printf '%s\n' 'export COMPOSER_HOME="$HOME/.config/composer"' 'export PATH="$COMPOSER_HOME/vendor/bin:$PATH"' | sudo tee /etc/profile.d/runova-laravel.sh >/dev/null
+            php --version | head -n 1
+          }
+          env_go() {
+            local f
+            f=$(curl -fsSL --retry 3 'https://go.dev/dl/?mode=json&include=all' | jq -r --arg p "go$1" '[.[].version | select(. == $p or startswith($p + "."))][0] // empty')
+            [ -n "$f" ] || { echo "Versi Go $1 tidak ditemukan." >&2; return 1; }
+            curl -fsSL --retry 3 "https://go.dev/dl/$f.linux-amd64.tar.gz" -o /tmp/go.tgz || return 1
+            sudo rm -rf /usr/local/go && sudo tar -C /usr/local -xzf /tmp/go.tgz || return 1
+            rm -f /tmp/go.tgz
+            sudo ln -sf /usr/local/go/bin/go /usr/local/bin/go
+            sudo ln -sf /usr/local/go/bin/gofmt /usr/local/bin/gofmt
+            printf '%s\n' 'export PATH="$PATH:$HOME/go/bin"' | sudo tee /etc/profile.d/runova-go.sh >/dev/null
+            /usr/local/go/bin/go version
+          }
+          sudo apt-get update -y >/dev/null 2>&1 || true
+          while read -r ID VER; do
+            case "$ID" in node|python|laravel|go) ;; *) echo "Template tidak dikenal dilewati." >&2; continue ;; esac
+            if ! [[ "$VER" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then echo "Versi $ID tidak valid, dilewati." >&2; continue; fi
+            echo "== Template $ID $VER"
+            if "env_$ID" "$VER"; then echo "Template $ID $VER siap."; else echo "Template $ID $VER gagal dipasang." >&2; fi
+          done <<< "$LIST"
+          exit 0
+
+      - name: Memasang pengaturan desktop
+        if: inputs.save_settings == '1' && inputs.runner != 'windows-11-dockur'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $work = Join-Path $env:RUNNER_TEMP 'rc'
+          New-Item -ItemType Directory -Force -Path $work | Out-Null
+          $ps1 = Join-Path $work 'profile.ps1'
+          $lg = Join-Path $work 'logon.ps1'
+          @'
+          param([string]$Mode)
+          $ErrorActionPreference = 'Continue'
+          $ProgressPreference = 'SilentlyContinue'
+          $branch = 'runova-settings'
+          $maxWall = 8MB
+          $maxTotal = 25MB
+          # Pengaturan desktop disimpan per mesin: windows-<id>.zip / linux-<id>.tgz (id mesin = ROOT_SID, atau SID untuk sesi pertama).
+          $mid = $env:SID; if ($env:ROOT_SID) { $mid = $env:ROOT_SID }
+          if ($IsWindows) { $legacyName = 'windows.zip'; $osn0 = 'windows'; $ext0 = 'zip' } else { $legacyName = 'linux.tgz'; $osn0 = 'linux'; $ext0 = 'tgz' }
+          if ($mid -match '^[0-9a-f]{12}$') { $arcName = "$osn0-$mid.$ext0" } else { $arcName = $legacyName }
+          $url = "https://github.com/$($env:GITHUB_REPOSITORY).git"
+          $b64 = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes("x-access-token:$($env:GH_TOKEN)"))
+          Write-Host "::add-mask::$b64"
+          $hdr = "http.https://github.com/.extraheader=AUTHORIZATION: basic $b64"
+          $base = Join-Path $env:RUNNER_TEMP 'rcprof'
+          $repoDir = Join-Path $base 'repo'
+          $stage = Join-Path $base 'stage'
+          $hashFile = Join-Path $base 'last.hash'
+          New-Item -ItemType Directory -Force -Path $base | Out-Null
+
+          function Get-Repo {
+            Remove-Item -Recurse -Force $repoDir -ErrorAction SilentlyContinue
+            git -c $hdr clone -q --branch $branch --single-branch $url $repoDir 2>$null
+            return ($LASTEXITCODE -eq 0)
+          }
+
+          # ---------------- Pulihkan ----------------
+          function Restore-Settings {
+            if (-not (Get-Repo)) { Write-Host 'Belum ada pengaturan tersimpan.'; return }
+            $a = Join-Path $repoDir $arcName
+            # mesin lama (dibuat sebelum pengaturan per mesin) memakai arsip per OS sebagai cadangan
+            if (-not (Test-Path $a) -and $env:ROOT_SID -and $arcName -ne $legacyName) { $a = Join-Path $repoDir $legacyName }
+            if (-not (Test-Path $a)) { Write-Host 'Belum ada pengaturan tersimpan untuk mesin ini.'; return }
+            if ($IsWindows) {
+              $root = 'C:\ProgramData\Runovacloud'
+              $dst = Join-Path $root 'profile'
+              Remove-Item -Recurse -Force $dst -ErrorAction SilentlyContinue
+              New-Item -ItemType Directory -Force -Path $dst | Out-Null
+              Expand-Archive -Path $a -DestinationPath $dst -Force
+              Copy-Item -Path (Join-Path $PSScriptRoot 'logon.ps1') -Destination (Join-Path $root 'logon.ps1') -Force
+              $cmd = 'powershell.exe -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "C:\ProgramData\Runovacloud\logon.ps1"'
+              Set-ItemProperty -Path 'HKLM:\Software\Microsoft\Windows\CurrentVersion\Run' -Name 'RunovacloudSettings' -Value $cmd
+              Set-Content -Path (Join-Path (Join-Path $env:RUNNER_TEMP 'rc') 'restored') -Value 1
+              Write-Host 'Pengaturan Windows akan dipasang saat kamu login pertama kali.'
+            } else {
+              $u = $env:RUSER
+              $uh = "/home/$u"
+              $x = Join-Path $base 'x'
+              Remove-Item -Recurse -Force $x -ErrorAction SilentlyContinue
+              New-Item -ItemType Directory -Force -Path $x | Out-Null
+              tar -xzf $a -C $x
+              if ($LASTEXITCODE -ne 0) { Write-Host 'Arsip pengaturan rusak, dilewati.'; return }
+              sudo mkdir -p "$uh/.local/share/runova-wallpapers"
+              if (Test-Path (Join-Path $x 'cfg')) { sudo cp -a "$x/cfg/." "$uh/" }
+              if (Test-Path (Join-Path $x 'wall')) { sudo cp -a "$x/wall/." "$uh/.local/share/runova-wallpapers/" }
+              $xf = "$uh/.config/xfce4/xfconf/xfce-perchannel-xml/xfce4-desktop.xml"
+              sudo test -f $xf
+              if ($LASTEXITCODE -eq 0) { sudo sed -i "s#__RCWALL__#$uh/.local/share/runova-wallpapers#g" $xf }
+              sudo chown -R "${u}:${u}" "$uh/.config" "$uh/.local"
+              Set-Content -Path (Join-Path (Join-Path $env:RUNNER_TEMP 'rc') 'restored') -Value 1
+              Write-Host 'Pengaturan XFCE dipasang.'
+            }
+          }
+
+          # ---------------- Simpan ----------------
+          function Get-Ext([string]$p) {
+            try {
+              $b = [IO.File]::ReadAllBytes($p)
+              if ($b.Length -gt 4) {
+                if ($b[0] -eq 0xFF -and $b[1] -eq 0xD8) { return '.jpg' }
+                if ($b[0] -eq 0x89 -and $b[1] -eq 0x50) { return '.png' }
+                if ($b[0] -eq 0x42 -and $b[1] -eq 0x4D) { return '.bmp' }
+              }
+            } catch {}
+            $e = [IO.Path]::GetExtension($p)
+            if ($e) { return $e }
+            return '.img'
+          }
+
+          function Stage-Windows {
+            $u = Get-LocalUser -Name $env:RUSER -ErrorAction SilentlyContinue
+            if (-not $u) { return $false }
+            $sid = $u.SID.Value
+            $p = Get-CimInstance Win32_UserProfile -Filter "SID='$sid'" -ErrorAction SilentlyContinue
+            if (-not $p) { Write-Host 'Belum ada profil pengguna (belum pernah login), tidak ada yang disimpan.'; return $false }
+            $hk = "HKU\$sid"
+            $ps = "Registry::HKEY_USERS\$sid"
+            $loaded = $false
+            if (-not (Test-Path $ps)) {
+              $nt = Join-Path $p.LocalPath 'NTUSER.DAT'
+              if (-not (Test-Path $nt)) { return $false }
+              reg load 'HKU\RCTMP' $nt | Out-Null
+              if ($LASTEXITCODE -ne 0) { return $false }
+              $hk = 'HKU\RCTMP'; $ps = 'Registry::HKEY_USERS\RCTMP'; $loaded = $true
+            }
+            try {
+              $keys = @(
+                @('Software\Microsoft\Windows\CurrentVersion\Themes\Personalize', 'personalize'),
+                @('Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced', 'explorer-advanced'),
+                @('Software\Microsoft\Windows\CurrentVersion\Explorer\Accent', 'accent'),
+                @('Software\Microsoft\Windows\CurrentVersion\Explorer\StuckRects3', 'taskbar'),
+                @('Software\Microsoft\Windows\CurrentVersion\Explorer\HideDesktopIcons', 'desktop-icons'),
+                @('Software\Microsoft\Windows\CurrentVersion\Search', 'search'),
+                @('Software\Microsoft\Windows\DWM', 'dwm')
+              )
+              foreach ($k in $keys) {
+                $f = Join-Path $stage ($k[1] + '.reg')
+                reg export "$hk\$($k[0])" $f /y 2>$null | Out-Null
+                if ($LASTEXITCODE -eq 0 -and (Test-Path $f)) {
+                  $t = [IO.File]::ReadAllText($f)
+                  $t = $t.Replace("HKEY_USERS\$sid", 'HKEY_CURRENT_USER').Replace('HKEY_USERS\RCTMP', 'HKEY_CURRENT_USER')
+                  [IO.File]::WriteAllText($f, $t, [Text.Encoding]::Unicode)
+                }
+              }
+              $meta = [ordered]@{ wallpaper_file = ''; wallpaper_sys = ''; style = $null; tile = $null; bgcolor = '' }
+              $d = Get-ItemProperty -Path "$ps\Control Panel\Desktop" -ErrorAction SilentlyContinue
+              if ($d) {
+                if ($d.WallpaperStyle -ne $null) { $meta.style = [string]$d.WallpaperStyle }
+                if ($d.TileWallpaper -ne $null) { $meta.tile = [string]$d.TileWallpaper }
+                $wp = [string]$d.WallPaper
+                if ($wp -and (Test-Path $wp)) {
+                  if ($wp.StartsWith($env:SystemRoot, [StringComparison]::OrdinalIgnoreCase)) { $meta.wallpaper_sys = $wp }
+                  elseif ((Get-Item $wp).Length -le $maxWall) {
+                    $wd = Join-Path $stage 'wallpaper'
+                    New-Item -ItemType Directory -Force -Path $wd | Out-Null
+                    $name = 'wallpaper' + (Get-Ext $wp)
+                    Copy-Item -Path $wp -Destination (Join-Path $wd $name) -Force
+                    $meta.wallpaper_file = $name
+                  } else { Write-Host 'Wallpaper lebih dari 8 MB, tidak ikut disimpan.' }
+                }
+              }
+              $c = Get-ItemProperty -Path "$ps\Control Panel\Colors" -ErrorAction SilentlyContinue
+              if ($c -and $c.Background) { $meta.bgcolor = [string]$c.Background }
+              ($meta | ConvertTo-Json -Compress) | Set-Content -Path (Join-Path $stage 'meta.json') -Encoding utf8
+            } finally {
+              if ($loaded) {
+                [GC]::Collect(); [GC]::WaitForPendingFinalizers()
+                for ($i = 0; $i -lt 5; $i++) { reg unload 'HKU\RCTMP' 2>$null | Out-Null; if ($LASTEXITCODE -eq 0) { break }; Start-Sleep -Seconds 1 }
+              }
+            }
+            return $true
+          }
+
+          function Stage-Linux {
+            $u = $env:RUSER
+            $uh = "/home/$u"
+            sudo test -d "$uh/.config/xfce4"
+            if ($LASTEXITCODE -ne 0) { Write-Host 'Belum ada pengaturan XFCE (belum pernah login), tidak ada yang disimpan.'; return $false }
+            $paths = @()
+            foreach ($c in @('.config/xfce4', '.config/gtk-3.0', '.config/Thunar')) {
+              sudo test -e "$uh/$c"
+              if ($LASTEXITCODE -eq 0) { $paths += $c }
+            }
+            $cfg = Join-Path $stage 'cfg'
+            $wall = Join-Path $stage 'wall'
+            New-Item -ItemType Directory -Force -Path $cfg, $wall | Out-Null
+            $env:RC_UH = $uh; $env:RC_DEST = $cfg; $env:RC_PATHS = ($paths -join ' ')
+            sudo -E bash -c 'cd "$RC_UH" && cp -a --parents $RC_PATHS "$RC_DEST" && find "$RC_DEST" \( -iname "*cache*" -o -name "*.log" \) -prune -exec rm -rf {} +'
+            $me = (id -un)
+            # wallpaper XFCE: salin file di luar /usr, ganti path jadi penanda
+            $xf = Join-Path $cfg '.config/xfce4/xfconf/xfce-perchannel-xml/xfce4-desktop.xml'
+            sudo chown -R "${me}:${me}" $stage
+            if (Test-Path $xf) {
+              $txt = [IO.File]::ReadAllText($xf)
+              $n = 0
+              foreach ($m in [regex]::Matches($txt, 'name="last-image"\s+type="string"\s+value="([^"]+)"')) {
+                $src = $m.Groups[1].Value
+                if ($src.StartsWith('/usr/') -or $src.StartsWith('__RCWALL__')) { continue }
+                sudo test -f $src
+                if ($LASTEXITCODE -ne 0) { continue }
+                $sz = [int64](sudo stat -c %s $src)
+                if ($sz -gt $maxWall) { continue }
+                $n++
+                $leaf = "$n-" + [IO.Path]::GetFileName($src)
+                sudo cp $src (Join-Path $wall $leaf)
+                sudo chown "${me}:${me}" (Join-Path $wall $leaf)
+                $txt = $txt.Replace('value="' + $src + '"', 'value="__RCWALL__/' + $leaf + '"')
+              }
+              [IO.File]::WriteAllText($xf, $txt)
+            }
+            return $true
+          }
+
+          function Save-Settings {
+            Remove-Item -Recurse -Force $stage -ErrorAction SilentlyContinue
+            New-Item -ItemType Directory -Force -Path $stage | Out-Null
+            if ($IsWindows) { $ok = Stage-Windows } else { $ok = Stage-Linux }
+            if (-not $ok) { return }
+            $files = @(Get-ChildItem -Path $stage -Recurse -File | Sort-Object FullName)
+            if ($files.Count -eq 0) { Write-Host 'Tidak ada pengaturan untuk disimpan.'; return }
+            $total = ($files | Measure-Object -Property Length -Sum).Sum
+            if ($total -gt $maxTotal) { Write-Host 'Pengaturan lebih dari 25 MB, tidak disimpan.'; return }
+            $parts = foreach ($f in $files) { (Get-FileHash -Path $f.FullName -Algorithm SHA256).Hash + $f.FullName.Substring($stage.Length) }
+            $sha = [Security.Cryptography.SHA256]::Create()
+            $hash = [BitConverter]::ToString($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes(($parts -join '|')))).Replace('-', '')
+            if ((Test-Path $hashFile) -and ((Get-Content -Path $hashFile -Raw).Trim() -eq $hash)) { Write-Host 'Pengaturan belum berubah.'; return }
+
+            $arc = Join-Path $base $arcName
+            Remove-Item -Force $arc -ErrorAction SilentlyContinue
+            if ($IsWindows) { Compress-Archive -Path (Join-Path $stage '*') -DestinationPath $arc -Force }
+            else { tar -czf $arc -C $stage . }
+            if (-not (Test-Path $arc)) { Write-Host 'Gagal membuat arsip pengaturan.'; return }
+
+            # ambil arsip OS lain (kalau ada), lalu simpan sebagai satu commit baru (riwayat tidak menumpuk)
+            if (-not (Get-Repo)) {
+              New-Item -ItemType Directory -Force -Path $repoDir | Out-Null
+              git -C $repoDir init -q
+              git -C $repoDir remote add origin $url
+            }
+            git -C $repoDir symbolic-ref HEAD refs/heads/rcnew
+            Copy-Item -Path $arc -Destination (Join-Path $repoDir $arcName) -Force
+            git -C $repoDir add -A
+            git -C $repoDir -c user.name=runovacloud -c user.email=runovacloud@users.noreply.github.com -c core.autocrlf=false commit -q -m "Pengaturan desktop $arcName"
+            if ($LASTEXITCODE -ne 0) { Write-Host 'Gagal membuat commit pengaturan.'; return }
+            git -C $repoDir -c $hdr push -q --force origin "rcnew:refs/heads/$branch" 2>$null
+            if ($LASTEXITCODE -ne 0) { Write-Host 'Gagal mengunggah pengaturan ke repository.'; return }
+            Set-Content -Path $hashFile -Value $hash
+            Write-Host 'Pengaturan desktop tersimpan.'
+          }
+
+          if ($Mode -eq 'restore') { Restore-Settings } elseif ($Mode -eq 'save') { Save-Settings }
+          '@ | Set-Content -Path $ps1 -Encoding utf8
+          @'
+          $ErrorActionPreference = 'SilentlyContinue'
+          $d = 'C:\ProgramData\Runovacloud\profile'
+          if (-not (Test-Path $d)) { exit }
+          $n = 0
+          Get-ChildItem -Path $d -Filter '*.reg' | ForEach-Object { reg import $_.FullName 2>&1 | Out-Null; $n++ }
+          $mf = Join-Path $d 'meta.json'
+          if (Test-Path $mf) {
+            $m = Get-Content -Path $mf -Raw | ConvertFrom-Json
+            if ($m.style -ne $null) { Set-ItemProperty -Path 'HKCU:\Control Panel\Desktop' -Name WallpaperStyle -Value ([string]$m.style) }
+            if ($m.tile -ne $null) { Set-ItemProperty -Path 'HKCU:\Control Panel\Desktop' -Name TileWallpaper -Value ([string]$m.tile) }
+            if ($m.bgcolor) { Set-ItemProperty -Path 'HKCU:\Control Panel\Colors' -Name Background -Value ([string]$m.bgcolor) }
+            $wp = ''
+            if ($m.wallpaper_file) { $wp = Join-Path (Join-Path $d 'wallpaper') ([string]$m.wallpaper_file) }
+            elseif ($m.wallpaper_sys) { $wp = [string]$m.wallpaper_sys }
+            if ($wp -and (Test-Path $wp)) {
+              Add-Type -TypeDefinition 'using System.Runtime.InteropServices; public class RcWall { [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern int SystemParametersInfo(int a, int b, string c, int d); }'
+              [RcWall]::SystemParametersInfo(20, 0, $wp, 3) | Out-Null
+            }
+          }
+          if ($n -gt 0) { Start-Sleep -Seconds 4; Stop-Process -Name explorer -Force }
+          '@ | Set-Content -Path $lg -Encoding utf8
+          "RC_PROF=1" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "RC_PROF_SCRIPT=$ps1" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          try { & pwsh -NoProfile -File $ps1 restore } catch { Write-Host 'Pengaturan tersimpan tidak bisa dipasang, dilewati.' }
+          exit 0
+
+      - name: Memasang wallpaper bawaan
+        if: env.RC_MODE != 'ssh' && inputs.runner != 'windows-11-dockur'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $ProgressPreference = 'SilentlyContinue'
+          try {
+            $work = Join-Path $env:RUNNER_TEMP 'rc'
+            New-Item -ItemType Directory -Force -Path $work | Out-Null
+            if (Test-Path (Join-Path $work 'restored')) {
+              $own = $true
+              $mf = 'C:\ProgramData\Runovacloud\profile\meta.json'
+              if ($IsWindows -and (Test-Path $mf)) { try { $own = [bool]((Get-Content -Path $mf -Raw | ConvertFrom-Json).wallpaper_file) } catch { $own = $true } }
+              if ($own) { throw 'Pengaturan tersimpan dipakai, wallpaper bawaan dilewati.' }
+            }
+            if ([string]::IsNullOrWhiteSpace($env:DRIVE_API)) { throw 'Alamat Runovacloud kosong, wallpaper bawaan dilewati.' }
+            # sesi pertama = belum ada snapshot untuk OS ini
+            $osn = 'linux'; if ($IsWindows) { $osn = 'windows' }
+            $names = gh api "repos/$($env:GITHUB_REPOSITORY)/releases/tags/runova-snapshots" --jq '.assets[].name' 2>$null
+            if ($LASTEXITCODE -eq 0 -and (@($names) -contains "snapshot-$osn.zip")) { throw 'Snapshot ditemukan, wallpaper bawaan dilewati.' }
+            $tmp = Join-Path $work 'wallpaper-default.jpg'
+            Invoke-WebRequest -Uri ($env:DRIVE_API.TrimEnd('/') + '/assets/wallpaper-default.jpg') -OutFile $tmp -TimeoutSec 40
+            $b = [IO.File]::ReadAllBytes($tmp)
+            if ($b.Length -lt 20000 -or $b[0] -ne 0xFF -or $b[1] -ne 0xD8) { throw 'File wallpaper bawaan tidak valid, dilewati.' }
+            if ($IsWindows) {
+              $root = 'C:\ProgramData\Runovacloud'
+              New-Item -ItemType Directory -Force -Path $root | Out-Null
+              Copy-Item -Path $tmp -Destination (Join-Path $root 'wallpaper.jpg') -Force
+              $lg = Join-Path $root 'wallpaper-logon.ps1'
+          @'
+          $ErrorActionPreference = 'SilentlyContinue'
+          $flag = Join-Path $env:APPDATA 'Runovacloud\wallpaper.done'
+          if (Test-Path $flag) { exit }
+          if (Test-Path 'C:\ProgramData\Runovacloud\profile\meta.json') { Start-Sleep -Seconds 10 }
+          $wp = 'C:\ProgramData\Runovacloud\wallpaper.jpg'
+          if (-not (Test-Path $wp)) { exit }
+          Set-ItemProperty -Path 'HKCU:\Control Panel\Desktop' -Name WallpaperStyle -Value '10'
+          Set-ItemProperty -Path 'HKCU:\Control Panel\Desktop' -Name TileWallpaper -Value '0'
+          Add-Type -TypeDefinition 'using System.Runtime.InteropServices; public class RcWall2 { [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern int SystemParametersInfo(int a, int b, string c, int d); }'
+          [RcWall2]::SystemParametersInfo(20, 0, $wp, 3) | Out-Null
+          New-Item -ItemType Directory -Force -Path (Split-Path $flag) | Out-Null
+          Set-Content -Path $flag -Value 1
+          '@ | Set-Content -Path $lg -Encoding utf8
+              $cmd = 'powershell.exe -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "C:\ProgramData\Runovacloud\wallpaper-logon.ps1"'
+              Set-ItemProperty -Path 'HKLM:\Software\Microsoft\Windows\CurrentVersion\Run' -Name 'RunovacloudWallpaper' -Value $cmd
+              Write-Host 'Wallpaper bawaan akan dipasang saat login pertama.'
+            } else {
+              $u = $env:RUSER
+              $uh = "/home/$u"
+              sudo mkdir -p "$uh/.local/share/runova-wallpapers" "$uh/.config/runova" "$uh/.config/autostart"
+              sudo cp $tmp "$uh/.local/share/runova-wallpapers/runovacloud.jpg"
+              $sh = Join-Path $work 'wallpaper.sh'
+          @'
+          #!/bin/bash
+          F="$HOME/.config/runova/wallpaper.done"
+          [ -f "$F" ] && exit 0
+          IMG="$HOME/.local/share/runova-wallpapers/runovacloud.jpg"
+          [ -f "$IMG" ] || exit 0
+          sleep 6
+          props=$(xfconf-query -c xfce4-desktop -l 2>/dev/null | grep 'last-image$')
+          if [ -z "$props" ]; then
+            for m in monitorrdp0 monitorVNC-0 monitor0; do
+              xfconf-query -c xfce4-desktop -p "/backdrop/screen0/$m/workspace0/last-image" -n -t string -s "$IMG"
+              xfconf-query -c xfce4-desktop -p "/backdrop/screen0/$m/workspace0/image-style" -n -t int -s 5
+            done
+          else
+            for p in $props; do
+              xfconf-query -c xfce4-desktop -p "$p" -s "$IMG"
+              xfconf-query -c xfce4-desktop -p "${p%last-image}image-style" -n -t int -s 5
+            done
+          fi
+          touch "$F"
+          '@ | Set-Content -Path $sh -Encoding utf8
+              $df = Join-Path $work 'runova-wallpaper.desktop'
+          @'
+          [Desktop Entry]
+          Type=Application
+          Name=Runovacloud Wallpaper
+          Exec=/bin/bash /home/__RCUSER__/.config/runova/wallpaper.sh
+          X-GNOME-Autostart-enabled=true
+          '@ | Set-Content -Path $df -Encoding utf8
+              (Get-Content -Path $df -Raw).Replace('__RCUSER__', $u) | Set-Content -Path $df -Encoding utf8
+              sudo cp $sh "$uh/.config/runova/wallpaper.sh"
+              sudo cp $df "$uh/.config/autostart/runova-wallpaper.desktop"
+              sudo chown -R "${u}:${u}" "$uh/.config" "$uh/.local"
+              Write-Host 'Wallpaper bawaan XFCE disiapkan.'
+            }
+          } catch { Write-Host "Wallpaper bawaan dilewati: $($_.Exception.Message)" }
+          exit 0
+
+      - name: Memasang tema dan wallpaper Max
+        if: inputs.extra != '' && env.RC_MODE != 'ssh' && inputs.runner != 'windows-11-dockur'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $ProgressPreference = 'SilentlyContinue'
+          try {
+            $x = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($env:EXTRA)) | ConvertFrom-Json
+            if (-not $x.deco) { throw 'Tidak ada tema atau wallpaper kustom.' }
+            $wall = [string]$x.deco.wall
+            $theme = [string]$x.deco.theme
+            $acc = [string]$x.deco.accent_hex
+            # daftar putih ketat: nilai ini masuk ke path URL dan skrip
+            if ($wall -notmatch '^[a-z]{3,12}$') { $wall = '' }
+            if ($theme -notin @('light', 'dark')) { $theme = '' }
+            if ($acc -notmatch '^#[0-9a-fA-F]{6}$') { $acc = '' }
+            if (-not $wall -and -not $theme -and -not $acc) { throw 'Pilihan tema tidak valid.' }
+            $work = Join-Path $env:RUNNER_TEMP 'rc'
+            New-Item -ItemType Directory -Force -Path $work | Out-Null
+            # hanya untuk RDP baru: desktop dengan pengaturan atau snapshot tersimpan tidak ditimpa
+            if (Test-Path (Join-Path $work 'restored')) { throw 'Pengaturan tersimpan dipakai, tema kustom dilewati.' }
+            $osn = 'linux'; if ($IsWindows) { $osn = 'windows' }
+            $names = gh api "repos/$($env:GITHUB_REPOSITORY)/releases/tags/runova-snapshots" --jq '.assets[].name' 2>$null
+            if ($LASTEXITCODE -eq 0 -and (@($names) -contains "snapshot-$osn.zip")) { throw 'Snapshot ditemukan, tema kustom dilewati.' }
+            $img = $null
+            if ($wall) {
+              if ([string]::IsNullOrWhiteSpace($env:DRIVE_API)) { throw 'Alamat Runovacloud kosong, wallpaper kustom dilewati.' }
+              $img = Join-Path $work ('wall-' + $wall + '.jpg')
+              Invoke-WebRequest -Uri ($env:DRIVE_API.TrimEnd('/') + '/assets/wallpapers/' + $wall + '.jpg') -OutFile $img -TimeoutSec 60
+              $b = [IO.File]::ReadAllBytes($img)
+              if ($b.Length -lt 20000 -or $b[0] -ne 0xFF -or $b[1] -ne 0xD8) { $img = $null; Write-Host 'File wallpaper kustom tidak valid, dilewati.' }
+            }
+            if ($IsWindows) {
+              $root = 'C:\ProgramData\Runovacloud'
+              New-Item -ItemType Directory -Force -Path $root | Out-Null
+              $cfg = [ordered]@{ theme = $theme; accent = $acc; wall = [bool]$img }
+              if ($img) { Copy-Item -Path $img -Destination (Join-Path $root 'wallpaper-max.jpg') -Force }
+              ($cfg | ConvertTo-Json -Compress) | Set-Content -Path (Join-Path $root 'deco.json') -Encoding utf8
+              $lg = Join-Path $root 'deco-logon.ps1'
+          @'
+          $ErrorActionPreference = 'SilentlyContinue'
+          $flag = Join-Path $env:APPDATA 'Runovacloud\deco.done'
+          if (Test-Path $flag) { exit }
+          $c = Get-Content -Path 'C:\ProgramData\Runovacloud\deco.json' -Raw | ConvertFrom-Json
+          if (-not $c) { exit }
+          # tunggu skrip wallpaper bawaan dan pengaturan tersimpan selesai dulu supaya pilihan Max yang menang
+          Start-Sleep -Seconds 14
+          $n = 0
+          if ($c.theme) {
+            $v = 0; if ($c.theme -eq 'light') { $v = 1 }
+            $p = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize'
+            New-Item -Path $p -Force | Out-Null
+            Set-ItemProperty -Path $p -Name AppsUseLightTheme -Value $v -Type DWord
+            Set-ItemProperty -Path $p -Name SystemUsesLightTheme -Value $v -Type DWord
+            $n++
+          }
+          if ($c.accent) {
+            $h = ([string]$c.accent).TrimStart('#')
+            $r = [Convert]::ToInt32($h.Substring(0, 2), 16); $g = [Convert]::ToInt32($h.Substring(2, 2), 16); $bl = [Convert]::ToInt32($h.Substring(4, 2), 16)
+            $abgr = [BitConverter]::ToInt32([byte[]]@($r, $g, $bl, 255), 0)
+            $d = 'HKCU:\Software\Microsoft\Windows\DWM'
+            New-Item -Path $d -Force | Out-Null
+            Set-ItemProperty -Path $d -Name AccentColor -Value $abgr -Type DWord
+            Set-ItemProperty -Path $d -Name ColorPrevalence -Value 1 -Type DWord
+            $e = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Accent'
+            New-Item -Path $e -Force | Out-Null
+            Set-ItemProperty -Path $e -Name AccentColorMenu -Value $abgr -Type DWord
+            Set-ItemProperty -Path $e -Name StartColorMenu -Value $abgr -Type DWord
+            $pp = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize'
+            New-Item -Path $pp -Force | Out-Null
+            Set-ItemProperty -Path $pp -Name ColorPrevalence -Value 1 -Type DWord
+            $n++
+          }
+          $wp = 'C:\ProgramData\Runovacloud\wallpaper-max.jpg'
+          if ($c.wall -and (Test-Path $wp)) {
+            Set-ItemProperty -Path 'HKCU:\Control Panel\Desktop' -Name WallpaperStyle -Value '10'
+            Set-ItemProperty -Path 'HKCU:\Control Panel\Desktop' -Name TileWallpaper -Value '0'
+            Add-Type -TypeDefinition 'using System.Runtime.InteropServices; public class RcWall3 { [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern int SystemParametersInfo(int a, int b, string c, int d); }'
+            [RcWall3]::SystemParametersInfo(20, 0, $wp, 3) | Out-Null
+          }
+          # wallpaper bawaan tidak boleh menimpa lagi di login berikutnya
+          New-Item -ItemType Directory -Force -Path (Split-Path $flag) | Out-Null
+          Set-Content -Path $flag -Value 1
+          Set-Content -Path (Join-Path (Split-Path $flag) 'wallpaper.done') -Value 1
+          if ($n -gt 0) { Start-Sleep -Seconds 3; Stop-Process -Name explorer -Force }
+          '@ | Set-Content -Path $lg -Encoding utf8
+              $cmd = 'powershell.exe -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "C:\ProgramData\Runovacloud\deco-logon.ps1"'
+              Set-ItemProperty -Path 'HKLM:\Software\Microsoft\Windows\CurrentVersion\Run' -Name 'RunovacloudDeco' -Value $cmd
+              Write-Host 'Tema dan wallpaper Max akan dipasang saat login pertama.'
+            } else {
+              $u = $env:RUSER
+              $uh = "/home/$u"
+              sudo mkdir -p "$uh/.local/share/runova-wallpapers" "$uh/.config/runova" "$uh/.config/autostart"
+              if ($img) { sudo cp $img "$uh/.local/share/runova-wallpapers/runova-max.jpg" }
+              $de = [string]$x.de
+              if (($de -eq 'i3' -or $de -eq 'sway') -and $img) {
+                # i3/sway: wallpaper lewat file konfigurasi (tema terang/gelap hanya untuk XFCE)
+                $wpath = "$uh/.local/share/runova-wallpapers/runova-max.jpg"
+                if ($de -eq 'i3') { $line = "exec_always --no-startup-id feh --bg-fill $wpath" } else { $line = "output * bg $wpath fill" }
+                $cf = "$uh/.config/$de/config"
+                $tmpc = Join-Path $work 'wmline.txt'
+                Set-Content -Path $tmpc -Value ("`n# Runovacloud Max`n" + $line + "`n") -Encoding utf8
+                sudo bash -c "cat '$tmpc' >> '$cf'"
+                sudo chown -R "${u}:${u}" "$uh/.config" "$uh/.local"
+                Write-Host "Wallpaper Max dipasang di konfigurasi $de."
+                throw 'Wallpaper untuk i3/sway selesai.'
+              }
+              if ($de -eq 'i3' -or $de -eq 'sway') { throw 'Tema terang/gelap hanya untuk XFCE, dilewati.' }
+              $sh = Join-Path $work 'deco.sh'
+              $sc = '#!/bin/bash' + "`n" + 'THEME="' + $theme + '"' + "`n" + 'WALL="' + $(if ($img) { '1' } else { '' }) + '"' + "`n"
+          $sc += @'
+          F="$HOME/.config/runova/deco.done"
+          [ -f "$F" ] && exit 0
+          # tunggu sesi XFCE dan skrip wallpaper bawaan selesai dulu
+          sleep 12
+          if [ -n "$WALL" ]; then
+            IMG="$HOME/.local/share/runova-wallpapers/runova-max.jpg"
+            if [ -f "$IMG" ]; then
+              props=$(xfconf-query -c xfce4-desktop -l 2>/dev/null | grep 'last-image$')
+              if [ -z "$props" ]; then
+                for m in monitorrdp0 monitorVNC-0 monitor0; do
+                  xfconf-query -c xfce4-desktop -p "/backdrop/screen0/$m/workspace0/last-image" -n -t string -s "$IMG"
+                  xfconf-query -c xfce4-desktop -p "/backdrop/screen0/$m/workspace0/image-style" -n -t int -s 5
+                done
+              else
+                for p in $props; do
+                  xfconf-query -c xfce4-desktop -p "$p" -s "$IMG"
+                  xfconf-query -c xfce4-desktop -p "${p%last-image}image-style" -n -t int -s 5
+                done
+              fi
+            fi
+          fi
+          if [ -n "$THEME" ]; then
+            if [ "$THEME" = "dark" ]; then
+              for t in Adwaita-dark Greybird-dark Yaru-dark; do [ -d "/usr/share/themes/$t" ] && T="$t" && break; done
+            else
+              for t in Adwaita Greybird Yaru; do [ -d "/usr/share/themes/$t" ] && T="$t" && break; done
+            fi
+            if [ -n "$T" ]; then
+              xfconf-query -c xsettings -p /Net/ThemeName -n -t string -s "$T"
+              [ -d "/usr/share/themes/$T/xfwm4" ] && xfconf-query -c xfwm4 -p /general/theme -n -t string -s "$T"
+            fi
+          fi
+          touch "$F" "$HOME/.config/runova/wallpaper.done"
+          '@
+              Set-Content -Path $sh -Value $sc -Encoding utf8
+              $df = Join-Path $work 'runova-deco.desktop'
+              $dc = "[Desktop Entry]`nType=Application`nName=Runovacloud Max Theme`nExec=/bin/bash /home/$u/.config/runova/deco.sh`nX-GNOME-Autostart-enabled=true`n"
+              Set-Content -Path $df -Value $dc -Encoding utf8
+              sudo cp $sh "$uh/.config/runova/deco.sh"
+              sudo cp $df "$uh/.config/autostart/runova-deco.desktop"
+              sudo chown -R "${u}:${u}" "$uh/.config" "$uh/.local"
+              Write-Host 'Tema dan wallpaper Max XFCE disiapkan.'
+            }
+          } catch { Write-Host "Tema Max dilewati: $($_.Exception.Message)" }
+          exit 0
+
+      - name: Memasang aplikasi dan state
+        if: inputs.extra != '' && inputs.runner != 'windows-11-dockur'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $work = Join-Path $env:RUNNER_TEMP 'rc'
+          New-Item -ItemType Directory -Force -Path $work | Out-Null
+          $sp = Join-Path $work 'state.ps1'
+          @'
+          param([string]$Mode)
+          $ErrorActionPreference = 'Continue'
+          $ProgressPreference = 'SilentlyContinue'
+          $win = $IsWindows
+          $base = Join-Path $env:RUNNER_TEMP 'rcstate'
+          New-Item -ItemType Directory -Force -Path $base | Out-Null
+          if ($win) { $ws = 'C:\Users\Public\Desktop\Workspace'; $os = 'windows' } else { $ws = "/home/$($env:RUSER)/Desktop/Workspace"; $os = 'linux' }
+          $tag = 'runova-snapshots'
+          $asset = "snapshot-$os.zip"
+          $zip = Join-Path $base $asset
+          $x = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($env:EXTRA)) | ConvertFrom-Json
+          function Get-Pk { if ($win) { choco list -l -r 2>$null | ForEach-Object { ($_ -split '\|')[0] } } else { apt-mark showmanual 2>$null } }
+          $script:fail = @()
+          function Set-Prog([string]$t) {
+            $o = [ordered]@{ t = $t; fail = @($script:fail) } | ConvertTo-Json -Compress
+            $b = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($o))
+            $api = "repos/$($env:GITHUB_REPOSITORY)/contents/.runova/$($env:SID).prog.json"
+            $sha = gh api $api --jq .sha 2>$null
+            if ($LASTEXITCODE -eq 0 -and $sha) { gh api -X PUT $api -f message='runova prog' -f content=$b -f sha=$sha 2>$null | Out-Null }
+            else { gh api -X PUT $api -f message='runova prog' -f content=$b 2>$null | Out-Null }
+          }
+
+          if ($Mode -eq 'install') {
+            Get-Pk | Set-Content -Path (Join-Path $base 'base.txt')
+            # 1) ringankan desktop (latar belakang, tidak menunggu)
+            foreach ($p in @($x.rm.p)) {
+              if (-not $p -or -not (Test-Path $p)) { continue }
+              Write-Host "Menghapus $p"
+              if ($win) { Start-Process -FilePath cmd.exe -ArgumentList "/c rmdir /s /q `"$p`"" -WindowStyle Hidden }
+              else { sudo bash -c "nohup rm -rf '$p' >/dev/null 2>&1 &" }
+            }
+            foreach ($sv in @($x.rm.s)) {
+              if ($win) { Stop-Service -Name $sv -Force -ErrorAction SilentlyContinue; Set-Service -Name $sv -StartupType Disabled -ErrorAction SilentlyContinue }
+              else { sudo systemctl disable --now $sv 2>$null }
+            }
+            # 2) pulihkan state Pro
+            $want = @()
+            if ($x.persist) {
+              if ($win) { New-Item -ItemType Directory -Force -Path $ws | Out-Null } else { sudo mkdir -p $ws }
+              Set-Prog 'Memulihkan snapshot'; gh release download $tag -R $env:GITHUB_REPOSITORY -p $asset -D $base --clobber 2>$null
+              if (Test-Path $zip) {
+                Expand-Archive -Path $zip -DestinationPath (Join-Path $base 'st') -Force
+                $af = Join-Path $base 'st/apps.json'
+                if (Test-Path $af) { $want = @(Get-Content -Path $af -Raw | ConvertFrom-Json) }
+                $st = Join-Path $base 'st'
+                if ($win) {
+                  $snap = 'C:\ProgramData\Runovacloud\snap'
+                  New-Item -ItemType Directory -Force -Path $snap | Out-Null
+                  foreach ($n in @('Desktop', 'Documents', 'Downloads', 'Roaming')) { if (Test-Path (Join-Path $st $n)) { Copy-Item -Path (Join-Path $st $n) -Destination $snap -Recurse -Force } }
+                  if (Test-Path (Join-Path $st 'Apps')) { New-Item -ItemType Directory -Force -Path 'C:\Apps' | Out-Null; Copy-Item -Path "$st/Apps/*" -Destination 'C:\Apps' -Recurse -Force }
+                  if (Test-Path (Join-Path $st 'Workspace')) { Copy-Item -Path "$st/Workspace/*" -Destination $ws -Recurse -Force }
+                  [IO.File]::WriteAllBytes('C:\ProgramData\Runovacloud\snaplogon.ps1', [Convert]::FromBase64String('JEVycm9yQWN0aW9uUHJlZmVyZW5jZSA9ICdTaWxlbnRseUNvbnRpbnVlJwokcyA9ICdDOlxQcm9ncmFtRGF0YVxSdW5vdmFjbG91ZFxzbmFwJwpmb3JlYWNoICgkbSBpbiBAKEAoJ0Rlc2t0b3AnLCBbRW52aXJvbm1lbnRdOjpHZXRGb2xkZXJQYXRoKCdEZXNrdG9wJykpLCBAKCdEb2N1bWVudHMnLCBbRW52aXJvbm1lbnRdOjpHZXRGb2xkZXJQYXRoKCdNeURvY3VtZW50cycpKSwgQCgnRG93bmxvYWRzJywgKEpvaW4tUGF0aCAkZW52OlVTRVJQUk9GSUxFICdEb3dubG9hZHMnKSksIEAoJ1JvYW1pbmcnLCAkZW52OkFQUERBVEEpKSkgewogIGlmIChUZXN0LVBhdGggKEpvaW4tUGF0aCAkcyAkbVswXSkpIHsgcm9ib2NvcHkgKEpvaW4tUGF0aCAkcyAkbVswXSkgJG1bMV0gL0UgL1I6MSAvVzoxIC9ORkwgL05ETCAvTkpIIC9OSlMgL05QIHwgT3V0LU51bGwgfQp9Cg=='))
+                  Set-ItemProperty -Path 'HKLM:\Software\Microsoft\Windows\CurrentVersion\Run' -Name 'RunovacloudSnap' -Value 'powershell.exe -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "C:\ProgramData\Runovacloud\snaplogon.ps1"'
+                } else {
+                  $uh = "/home/$($env:RUSER)"
+                  foreach ($n in @('Desktop', 'Documents', 'Downloads', '.config', '.mozilla')) { if (Test-Path (Join-Path $st $n)) { sudo mkdir -p "$uh/$n"; sudo cp -a "$st/$n/." "$uh/$n/" } }
+                  if (Test-Path (Join-Path $st '.mozilla-snap')) { sudo mkdir -p "$uh/snap/firefox/common/.mozilla"; sudo cp -a "$st/.mozilla-snap/." "$uh/snap/firefox/common/.mozilla/" }
+                  sudo chown -R "$($env:RUSER):$($env:RUSER)" $uh 2>$null
+                }
+                Write-Host "Snapshot dipulihkan ($($want.Count) aplikasi)."
+              } else { Write-Host 'Belum ada snapshot tersimpan.' }
+              ($want | ConvertTo-Json -Compress) | Set-Content -Path (Join-Path $base 'prev.json')
+            }
+            # 3) pasang aplikasi pilihan + aplikasi tersimpan, satu per satu supaya log dan kegagalan jelas
+            $list = @()
+            foreach ($a in @($x.apps)) {
+              if ($win) { $list += [pscustomobject]@{ n = $a.n; p = $a.w; d = '' } }
+              else { if ($a.l) { $list += [pscustomobject]@{ n = $a.n; p = $a.l; d = '' } }; if ($a.d) { $list += [pscustomobject]@{ n = $a.n; p = ''; d = $a.d } } }
+            }
+            foreach ($w in @($want)) { if ($w -and -not ($list | Where-Object { $_.p -eq $w })) { $list += [pscustomobject]@{ n = [string]$w; p = [string]$w; d = '' } } }
+            if (-not $win -and $list.Count -gt 0) { sudo apt-get update -y 2>$null | Out-Null }
+            $i = 0
+            foreach ($it in $list) {
+              $i++
+              Set-Prog "Memasang $i/$($list.Count): $($it.n)"
+              Write-Host "Memasang $($it.n)"
+              if ($win) { choco install $it.p -y --no-progress --limit-output --ignore-checksums; $ok = ($LASTEXITCODE -eq 0 -or $LASTEXITCODE -eq 3010) }
+              elseif ($it.d) { $f = Join-Path $base 'app.deb'; try { Invoke-WebRequest -Uri $it.d -OutFile $f; sudo DEBIAN_FRONTEND=noninteractive apt-get install -y $f; $ok = ($LASTEXITCODE -eq 0) } catch { $ok = $false } }
+              else { sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends @($it.p -split ' '); $ok = ($LASTEXITCODE -eq 0) }
+              if (-not $ok) { $script:fail += $it.n; Write-Host "GAGAL: $($it.n)" }
+            }
+            if ($list.Count -gt 0) { Set-Prog ("Aplikasi: " + ($list.Count - $script:fail.Count) + ' berhasil, ' + $script:fail.Count + ' gagal') }
+            # 4) script kustom (Pro): PowerShell di Windows, Bash di Linux
+            if ($x.script) {
+              Write-Host 'Menjalankan script kustom.'; Set-Prog 'Menjalankan script kustom'
+              $env:RUNOVA_USER = $env:RUSER
+              if ($win) { $sf = Join-Path $base 'custom.ps1'; $x.script | Set-Content -Path $sf -Encoding utf8; try { & pwsh -NoProfile -File $sf } catch { Write-Host 'Script kustom gagal.' } }
+              else { $sf = Join-Path $base 'custom.sh'; $x.script | Set-Content -Path $sf; try { sudo -E bash $sf } catch { Write-Host 'Script kustom gagal.' } }
+            }
+            if ($x.script) { Set-Prog ('Script kustom selesai. Aplikasi gagal: ' + $script:fail.Count) }
+            if (-not $win) { sudo chown -R "$($env:RUSER):$($env:RUSER)" "/home/$($env:RUSER)/Desktop" 2>$null }
+            # 5) Login browser (Linux): Chrome/Chromium/Brave/Edge memakai penyimpanan sandi "basic" supaya cookie tidak terkunci ke keyring mesin lama.
+            if (-not $win -and $x.persist) {
+              Get-ChildItem -Path /usr/share/applications -Filter '*.desktop' -ErrorAction SilentlyContinue | Where-Object { $_.Name -match '^(google-chrome|chromium|brave-browser|microsoft-edge)' } | ForEach-Object {
+                sudo sed -i -E '/^Exec=/ { /--password-store/! s#^(Exec=[^ ]+)#\1 --password-store=basic# }' $_.FullName
+                Write-Host "Peluncur browser disesuaikan: $($_.Name)"
+              }
+            }
+          }
+
+          if ($Mode -eq 'save') {
+            if (-not $x.persist) { return }
+            $basePk = @(Get-Content -Path (Join-Path $base 'base.txt') -ErrorAction SilentlyContinue)
+            $prev = @(); $pf = Join-Path $base 'prev.json'
+            if (Test-Path $pf) { $prev = @(Get-Content -Path $pf -Raw | ConvertFrom-Json) }
+            $all = @($prev) + @(Get-Pk | Where-Object { $_ -and ($basePk -notcontains $_) }) | Where-Object { $_ } | Select-Object -Unique
+            $out = Join-Path $base 'out'
+            Remove-Item -Recurse -Force $out -ErrorAction SilentlyContinue
+            New-Item -ItemType Directory -Force -Path $out | Out-Null
+            ConvertTo-Json -InputObject @($all) -Compress | Set-Content -Path (Join-Path $out 'apps.json')
+            $items = @((Join-Path $out 'apps.json'))
+            if ($win) { $uh = "C:\Users\$($env:RUSER)"; $cand = @($ws, 'C:\Apps', "$uh\Documents", "$uh\Desktop", "$uh\AppData\Roaming", "$uh\Downloads") }
+            else { $uh = "/home/$($env:RUSER)"; sudo chmod -R a+rX $uh 2>$null; $cand = @("$uh/Documents", "$uh/Desktop", "$uh/.config", "$uh/.mozilla", "$uh/Downloads") }
+            # Simpan akhir: tutup browser dulu supaya cookie/login tertulis utuh dan file tidak terkunci.
+            if ($env:RC_FINAL -eq '1') {
+              if ($win) {
+                foreach ($b in @('firefox', 'chrome', 'msedge', 'brave')) { Get-Process -Name $b -ErrorAction SilentlyContinue | ForEach-Object { [void]$_.CloseMainWindow() } }
+                Start-Sleep -Seconds 6
+                foreach ($b in @('firefox', 'chrome', 'msedge', 'brave')) { Get-Process -Name $b -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue }
+              } else {
+                foreach ($b in @('chrome', 'chromium', 'brave', 'msedge', 'firefox', 'firefox-bin')) { sudo pkill -TERM -u $env:RUSER -x $b 2>$null }
+                Start-Sleep -Seconds 6
+              }
+            }
+            if (-not $win) {
+              # Buang cache browser supaya snapshot tidak membengkak (login dan pengaturan tetap).
+              foreach ($b in @('.config/google-chrome', '.config/chromium', '.config/BraveSoftware', '.config/microsoft-edge')) {
+                if (Test-Path "$uh/$b") { sudo bash -c "find '$uh/$b' -type d \( -name Cache -o -name 'Code Cache' -o -name GPUCache -o -name CacheStorage -o -name ShaderCache -o -name GrShaderCache -o -name DawnCache \) -prune -exec rm -rf {} +" 2>$null }
+              }
+              # Firefox versi snap menyimpan profil di tempat lain; salin ke area sementara dengan nama aman.
+              $bs = Join-Path $base 'bs'
+              sudo rm -rf $bs
+              $sn = "$uh/snap/firefox/common/.mozilla"
+              if (Test-Path $sn) {
+                sudo mkdir -p $bs
+                sudo cp -a $sn (Join-Path $bs '.mozilla-snap')
+                sudo chmod -R a+rX $bs
+                $cand += (Join-Path $bs '.mozilla-snap')
+              }
+            }
+            $tot = 0
+            foreach ($c in $cand) {
+              if (-not (Test-Path $c)) { continue }
+              $z = (Get-ChildItem -Path $c -Recurse -File -Force -ErrorAction SilentlyContinue | Measure-Object -Property Length -Sum).Sum
+              if (-not $z) { continue }
+              if ($tot + $z -gt 1.9GB) { Write-Host "Dilewati (melebihi batas 1,9 GB): $c"; continue }
+              $tot += $z; $items += $c
+            }
+            Remove-Item -Force $zip -ErrorAction SilentlyContinue
+            if ($win) {
+              # Salin dulu ke area sementara (robocopy melewati file yang terkunci & cache) supaya Compress-Archive tidak gagal.
+              $stage = Join-Path $base 'stage'
+              Remove-Item -Recurse -Force $stage -ErrorAction SilentlyContinue
+              New-Item -ItemType Directory -Force -Path $stage | Out-Null
+              Copy-Item -Path (Join-Path $out 'apps.json') -Destination $stage -Force
+              foreach ($c in $items) {
+                if ($c -like '*apps.json') { continue }
+                $leaf = Split-Path $c -Leaf
+                robocopy $c (Join-Path $stage $leaf) /E /R:0 /W:0 /XJ /NFL /NDL /NJH /NJS /NP /XD Cache 'Code Cache' GPUCache cache2 CacheStorage ShaderCache GrShaderCache DawnCache 'Crash Reports' | Out-Null
+              }
+              $items = @(Get-ChildItem -Path $stage -Force | ForEach-Object { $_.FullName })
+            }
+            try { Compress-Archive -Path $items -DestinationPath $zip -Force -ErrorAction Stop } catch { Write-Host ('Kompres gagal: ' + $_.Exception.Message) }
+            if (-not (Test-Path $zip)) { Write-Host 'Gagal menyimpan snapshot (file zip tidak terbentuk).'; return }
+            Write-Host ('Ukuran snapshot: ' + [math]::Round((Get-Item $zip).Length / 1MB) + ' MB')
+            gh release view $tag -R $env:GITHUB_REPOSITORY 2>$null | Out-Null
+            if ($LASTEXITCODE -ne 0) { $o = gh release create $tag -R $env:GITHUB_REPOSITORY --title 'Runovacloud state' --notes 'State Pro Runovacloud. Jangan dihapus.' --prerelease 2>&1; Write-Host ('Buat release: ' + ($o | Out-String)) }
+            $o = gh release upload $tag $zip -R $env:GITHUB_REPOSITORY --clobber 2>&1
+            if ($LASTEXITCODE -eq 0) { Write-Host 'Snapshot tersimpan.' } else { Write-Host ('Gagal menyimpan snapshot. ' + ($o | Out-String)) }
+          }
+          '@ | Set-Content -Path $sp -Encoding utf8
+          "RC_STATE_SCRIPT=$sp" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          try { & pwsh -NoProfile -File $sp install } catch { Write-Host 'Pemasangan aplikasi sebagian gagal, sesi tetap lanjut.' }
+          $j = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($env:EXTRA)) | ConvertFrom-Json
+          if ($j.persist) { 'RC_STATE=1' | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8 }
+          exit 0
+
+      - name: Menyiapkan Google Drive
+        if: inputs.drive_mode != '' && inputs.runner != 'windows-11-dockur'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $work = Join-Path $env:RUNNER_TEMP 'rc'
+          New-Item -ItemType Directory -Force -Path $work | Out-Null
+          if ($IsWindows) { $ws = 'C:\Users\Public\Desktop\Workspace' } else { $ws = "/home/$($env:RUSER)/Desktop/Workspace" }
+          if ($IsWindows) { New-Item -ItemType Directory -Force -Path $ws | Out-Null } else { sudo mkdir -p "$ws" }
+          $ver = 'v1.68.2'
+          if ($IsWindows) { $zip = "rclone-$ver-windows-amd64.zip" } else { $zip = "rclone-$ver-linux-amd64.zip" }
+          Invoke-WebRequest -Uri "https://downloads.rclone.org/$ver/$zip" -OutFile (Join-Path $work $zip)
+          Expand-Archive -Path (Join-Path $work $zip) -DestinationPath $work -Force
+          $rc = (Get-ChildItem -Path $work -Recurse -File | Where-Object { $_.Name -in @('rclone', 'rclone.exe') } | Select-Object -First 1).FullName
+          if (-not $IsWindows) { chmod +x $rc }
+          $sync = Join-Path $work 'sync.ps1'
+          @'
+          param([string]$Mode)
+          $ErrorActionPreference = 'Stop'
+          $t = Invoke-RestMethod -Method Post -Uri "$($env:DRIVE_API)/api/google/token" -ContentType 'application/json' -Body (@{ ticket = $env:DRIVE_TICKET } | ConvertTo-Json)
+          Write-Host "::add-mask::$($t.access_token)"
+          $exp = [DateTime]::UtcNow.AddMinutes(50).ToString('o')
+          $env:RCLONE_CONFIG_GD_TYPE = 'drive'
+          $env:RCLONE_CONFIG_GD_SCOPE = 'drive.file'
+          $env:RCLONE_CONFIG_GD_ROOT_FOLDER_ID = $env:DRIVE_FOLDER
+          $env:RCLONE_CONFIG_GD_TOKEN = (@{ access_token = $t.access_token; token_type = 'Bearer'; expiry = $exp } | ConvertTo-Json -Compress)
+          $ex = @('--exclude', 'desktop.ini', '--exclude', 'Thumbs.db', '--exclude', '~$*')
+          if ($Mode -eq 'down') { $a = @('copy', 'gd:', $env:RC_WS, '--transfers', '4', '-q') + $ex }
+          else { $a = @('copy', $env:RC_WS, 'gd:', '--update', '--transfers', '4', '-q') + $ex }
+          if ($IsWindows) { & $env:RC_RCLONE @a } else { sudo -E $env:RC_RCLONE @a }
+          if ($LASTEXITCODE -ne 0) { throw "rclone gagal ($LASTEXITCODE)" }
+          '@ | Set-Content -Path $sync -Encoding utf8
+          "RC_WS=$ws" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "RC_RCLONE=$rc" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "RC_SYNC_SCRIPT=$sync" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          if ($env:DRIVE_MODE -eq 'sync') { 'RC_SYNC=1' | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8 }
+          $env:RC_WS = $ws; $env:RC_RCLONE = $rc
+          & pwsh -NoProfile -File $sync down
+          if (-not $IsWindows) { sudo chown -R "$($env:RUSER):$($env:RUSER)" "/home/$($env:RUSER)/Desktop" }
+          Write-Host "Folder kerja siap: $ws"
+
+      - name: Perlindungan penyalahgunaan
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          try {
+            $pools = @('pool.supportxmr.com','pool.minexmr.com','fr.minexmr.com','de.minexmr.com','ca.minexmr.com','xmr.pool.minergate.com','xmr-eu1.nanopool.org','xmr-us-east1.nanopool.org','xmr-asia1.nanopool.org','eth-eu1.nanopool.org','pool.hashvault.pro','gulf.moneroocean.stream','pool.moneroocean.stream','mine.c3pool.com','randomxmonero.auto.nicehash.com','randomxmonero.usa-east.nicehash.com','daggerhashimoto.auto.nicehash.com','stratum.nicehash.com','xmr.2miners.com','eth.2miners.com','rvn.2miners.com','etc.2miners.com','xmr.f2pool.com','eth.f2pool.com','pool.unmineable.io','rx.unmineable.io','xmrpool.eu','pool.xmrpool.eu','monerohash.com','pool.rplant.xyz','asia.ethermine.org','eu1.ethermine.org','us1.ethermine.org','xmr.herominers.com','pool.miningpoolhub.com','hub.miningpoolhub.com','xmr.kryptex.network','pool.kryptex.com')
+            $lines = @('') + @($pools | ForEach-Object { "0.0.0.0 $_" })
+            if ($IsWindows) { Add-Content -Path 'C:\Windows\System32\drivers\etc\hosts' -Value $lines -Encoding ascii }
+            else { ($lines -join "`n") | sudo tee -a /etc/hosts | Out-Null }
+            Write-Host 'Pool penambangan kripto yang umum diblokir di mesin ini.'
+          } catch { Write-Host "Pemblokiran pool dilewati: $($_.Exception.Message)" }
+          exit 0
+
+      - name: Membuka koneksi jarak jauh
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $env:NO_COLOR = '1'
+          $work = Join-Path $env:RUNNER_TEMP 'rc'
+          New-Item -ItemType Directory -Force -Path $work | Out-Null
+          $api = "repos/$($env:GITHUB_REPOSITORY)/contents/.runova/$($env:SID).json"
+          $minutes = [int]$env:MINUTES
+          $useNgrok = -not [string]::IsNullOrWhiteSpace($env:NGROK_AUTH_TOKEN)
+          $frp = $null
+          if (-not $useNgrok -and -not [string]::IsNullOrWhiteSpace($env:FRP)) {
+            $fp = $env:FRP.Split('|')
+            if ($fp.Count -ge 3 -and $fp[0] -match '^[^:\s]+:\d+$' -and $fp[1] -and $fp[2] -match '^\d+-\d+$') {
+              Write-Host "::add-mask::$($fp[1])"
+              $frp = @{ host = $fp[0].Split(':')[0]; port = [int]$fp[0].Split(':')[1]; token = $fp[1]; lo = [int]$fp[2].Split('-')[0]; hi = [int]$fp[2].Split('-')[1] }
+            }
+          }
+          $useFrp = [bool]$frp
+          # Mode Dev (RC_MODE=ssh) membuka port 22, mode biasa membuka RDP di 3389.
+          $svcPort = 3389; $svcMode = 'rdp'
+          if ($env:RC_MODE -eq 'ssh') { $svcPort = 22; $svcMode = 'ssh' }
+          $webUrl = ''
+          $webRestarts = 0
+          $webPort = $svcPort
+          if ($env:RC_WEB -eq '1') { $webPort = 7681 }
+          # Port publik Mode Dev (Pro/Max): cloudflared kedua ke localhost:RC_PP. 0 = mati.
+          $pubUrl = ''
+          $pubRestarts = 0
+          $ppPort = 0
+          if ($env:RC_WEB -eq '1' -and $env:RC_PP -match '^\d{4,5}$') { $ppPort = [int]$env:RC_PP }
+          $pubPort = $svcPort
+          if ($ppPort -gt 0) { $pubPort = $ppPort }
+
+          # Spesifikasi runner (CPU, jumlah core logis, RAM GB) untuk ditampilkan di RDP Saya. Gagal membaca tidak menghentikan sesi.
+          $spec = [ordered]@{ cpu = ''; cores = 0; ram = 0 }
+          try {
+            if ($IsWindows) {
+              $pc = Get-CimInstance Win32_Processor | Select-Object -First 1
+              $cs = Get-CimInstance Win32_ComputerSystem
+              $spec.cpu = ([string]$pc.Name).Trim(); $spec.cores = [int]$cs.NumberOfLogicalProcessors; $spec.ram = [math]::Round($cs.TotalPhysicalMemory / 1GB, 1)
+            } else {
+              $spec.cpu = ((Get-Content /proc/cpuinfo | Where-Object { $_ -match '^model name' } | Select-Object -First 1) -replace '^[^:]*:\s*', '').Trim()
+              $spec.cores = [int](nproc)
+              $spec.ram = [math]::Round([double]((Get-Content /proc/meminfo | Select-Object -First 1) -replace '[^\d]', '') / 1048576, 1)
+            }
+          } catch { Write-Host "Spesifikasi runner tidak terbaca: $($_.Exception.Message)" }
+
+          function Publish-Session([string]$Addr, [int]$Port, [string]$Expires, [string]$Status = 'ready') {
+            $info = [ordered]@{ session = $env:SID; status = $Status; graceful = $true; host = $Addr; port = $Port; username = $env:RUSER; runner = $env:RLABEL; expires = $Expires; run_id = $env:GITHUB_RUN_ID; mode = $svcMode; fp = [string]$env:RC_FP; web = [string]$webUrl; pub = [string]$pubUrl; pp = $ppPort; cpu = $spec.cpu; cores = $spec.cores; ram = $spec.ram } | ConvertTo-Json -Compress
+            $b64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($info))
+            for ($i = 0; $i -lt 5; $i++) {
+              $sha = gh api $api --jq .sha 2>$null
+              if ($LASTEXITCODE -eq 0 -and $sha) { gh api -X PUT $api -f message="runova $($env:SID)" -f content=$b64 -f sha=$sha 2>$null | Out-Null }
+              else { gh api -X PUT $api -f message="runova $($env:SID)" -f content=$b64 2>$null | Out-Null }
+              if ($LASTEXITCODE -eq 0) { return }
+              Start-Sleep -Seconds (2 + 2 * $i)
+            }
+            throw 'Gagal menulis info sesi ke repository.'
+          }
+
+          if ($useNgrok) {
+            if ($IsWindows) {
+              $arc = Join-Path $work 'ngrok.zip'
+              Invoke-WebRequest -Uri 'https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-windows-amd64.zip' -OutFile $arc
+              Expand-Archive -Path $arc -DestinationPath $work -Force
+              $exe = Join-Path $work 'ngrok.exe'
+            } else {
+              $arc = Join-Path $work 'ngrok.tgz'
+              Invoke-WebRequest -Uri 'https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-linux-amd64.tgz' -OutFile $arc
+              tar -xzf $arc -C $work
+              $exe = Join-Path $work 'ngrok'
+              chmod +x $exe
+            }
+            & $exe config add-authtoken $env:NGROK_AUTH_TOKEN | Out-Null
+            Write-Host 'Tunnel: ngrok (dari secret NGROK_AUTH_TOKEN)'
+          } elseif ($useFrp) {
+            $fv = '0.72.0'
+            if ($IsWindows) {
+              $arc = Join-Path $work 'frp.zip'
+              Invoke-WebRequest -Uri "https://github.com/fatedier/frp/releases/download/v$fv/frp_${fv}_windows_amd64.zip" -OutFile $arc
+              Expand-Archive -Path $arc -DestinationPath $work -Force
+              $exe = Join-Path $work "frp_${fv}_windows_amd64\frpc.exe"
+            } else {
+              $arc = Join-Path $work 'frp.tgz'
+              Invoke-WebRequest -Uri "https://github.com/fatedier/frp/releases/download/v$fv/frp_${fv}_linux_amd64.tar.gz" -OutFile $arc
+              tar -xzf $arc -C $work
+              $exe = Join-Path $work "frp_${fv}_linux_amd64/frpc"
+              chmod +x $exe
+            }
+            Write-Host 'Tunnel: relay Runovacloud (frp)'
+          } else {
+            $ver = 'v0.6.0'
+            if ($IsWindows) {
+              $name = "bore-$ver-x86_64-pc-windows-msvc.zip"
+              $arc = Join-Path $work $name
+              Invoke-WebRequest -Uri "https://github.com/ekzhang/bore/releases/download/$ver/$name" -OutFile $arc
+              Expand-Archive -Path $arc -DestinationPath $work -Force
+              $exe = Join-Path $work 'bore.exe'
+            } else {
+              $name = "bore-$ver-x86_64-unknown-linux-musl.tar.gz"
+              $arc = Join-Path $work $name
+              Invoke-WebRequest -Uri "https://github.com/ekzhang/bore/releases/download/$ver/$name" -OutFile $arc
+              tar -xzf $arc -C $work
+              $exe = Join-Path $work 'bore'
+              chmod +x $exe
+            }
+            Write-Host 'Tunnel: bore.pub'
+          }
+
+          function Start-Tunnel {
+            $outf = Join-Path $work 'tunnel.out'
+            $errf = Join-Path $work 'tunnel.err'
+            Remove-Item $outf, $errf -ErrorAction SilentlyContinue
+            if ($useFrp) {
+              $cfg = Join-Path $work 'frpc.toml'
+              foreach ($rp in (@(($frp.lo)..($frp.hi)) | Sort-Object { Get-Random })) {
+                Remove-Item $outf, $errf -ErrorAction SilentlyContinue
+                $lines = @(
+                  "serverAddr = `"$($frp.host)`"",
+                  "serverPort = $($frp.port)",
+                  "auth.token = `"$($frp.token)`"",
+                  '[[proxies]]',
+                  "name = `"rdp-$($env:SID)`"",
+                  'type = "tcp"',
+                  'localIP = "127.0.0.1"',
+                  "localPort = $svcPort",
+                  "remotePort = $rp"
+                )
+                Set-Content -Path $cfg -Value $lines -Encoding ascii
+                $p = Start-Process -FilePath $exe -ArgumentList @('-c', $cfg) -RedirectStandardOutput $outf -RedirectStandardError $errf -PassThru -NoNewWindow
+                for ($i = 0; $i -lt 12; $i++) {
+                  Start-Sleep -Seconds 1
+                  $txt = ''
+                  foreach ($f in @($outf, $errf)) { if (Test-Path $f) { $txt += [string](Get-Content $f -Raw) } }
+                  if ($txt -match 'start proxy success') { return @{ proc = $p; host = $frp.host; port = $rp } }
+                  if ($p.HasExited -or $txt -match 'start error|already used') { break }
+                }
+                if (-not $p.HasExited) { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue }
+              }
+              return $null
+            }
+            if ($useNgrok) { $args2 = @('tcp', [string]$svcPort, '--log=stdout') } else { $args2 = @('local', [string]$svcPort, '--to', 'bore.pub') }
+            $p = Start-Process -FilePath $exe -ArgumentList $args2 -RedirectStandardOutput $outf -RedirectStandardError $errf -PassThru -NoNewWindow
+            for ($i = 0; $i -lt 40; $i++) {
+              Start-Sleep -Seconds 2
+              if ($p.HasExited) { break }
+              if ($useNgrok) {
+                try {
+                  $t = Invoke-RestMethod -Uri 'http://127.0.0.1:4040/api/tunnels' -TimeoutSec 3
+                  foreach ($x in $t.tunnels) {
+                    if ($x.public_url -match '^tcp://([^:]+):(\d+)$') { return @{ proc = $p; host = $Matches[1]; port = [int]$Matches[2] } }
+                  }
+                } catch {}
+              } else {
+                $txt = ''
+                foreach ($f in @($outf, $errf)) { if (Test-Path $f) { $txt += [string](Get-Content $f -Raw) } }
+                if ($txt -match 'bore\.pub:(\d+)') { return @{ proc = $p; host = 'bore.pub'; port = [int]$Matches[1] } }
+              }
+            }
+            if (-not $p.HasExited) { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue }
+            return $null
+          }
+
+          $t = $null
+          for ($a = 0; $a -lt 3 -and -not $t; $a++) { $t = Start-Tunnel }
+          if (-not $t) { throw 'Tidak bisa membuka tunnel. Coba lagi sebentar lagi.' }
+
+          # Terminal di browser (Mode Dev): ttyd di 127.0.0.1:7681 + cloudflared quick tunnel (https), dikunci basic auth (username + password sesi).
+          # Gagal di sini tidak menghentikan sesi: SSH tetap jalan. URL tidak dicetak ke log.
+          function Start-WebTerm($old) {
+            $r = @{ url = ''; ttyd = $null; cf = $null }
+            if ($env:RC_WEB -ne '1') { return $r }
+            try {
+              if ($old) { if ($old.cf) { Stop-Process -Id $old.cf.Id -Force -ErrorAction SilentlyContinue }; & sudo pkill -x ttyd 2>$null; Start-Sleep -Seconds 1 }
+              $to = Join-Path $work 'ttyd.out'; $te = Join-Path $work 'ttyd.err'
+              $co = Join-Path $work 'cf.out'; $ce = Join-Path $work 'cf.err'
+              Remove-Item $to, $te, $co, $ce -Force -ErrorAction SilentlyContinue
+              $ta = @('-u', $env:RUSER, '-H', '/usr/local/bin/ttyd', '-p', '7681', '-i', '127.0.0.1', '-m', '3', '-c', "$($env:RUSER):$($env:RPW)", '-t', 'fontSize=15')
+              if ($env:RC_TTYD_W) { $ta += $env:RC_TTYD_W }
+              $sh = '/bin/bash'; if ($env:RC_SHELL -and (Test-Path $env:RC_SHELL)) { $sh = $env:RC_SHELL }
+              $ta += @($sh, '-l')
+              $r.ttyd = Start-Process -FilePath 'sudo' -ArgumentList $ta -RedirectStandardOutput $to -RedirectStandardError $te -PassThru -NoNewWindow
+              Start-Sleep -Seconds 2
+              if ($r.ttyd.HasExited) { Write-Host 'Terminal web: ttyd gagal jalan.'; return @{ url = ''; ttyd = $null; cf = $null } }
+              $r.cf = Start-Process -FilePath '/usr/local/bin/cloudflared' -ArgumentList @('tunnel', '--no-autoupdate', '--protocol', 'http2', '--url', 'http://127.0.0.1:7681') -RedirectStandardOutput $co -RedirectStandardError $ce -PassThru -NoNewWindow
+              $seen = ''
+              for ($i = 0; $i -lt 45; $i++) {
+                Start-Sleep -Seconds 1
+                if ($r.cf.HasExited) { break }
+                $txt = ''
+                foreach ($f in @($co, $ce)) { if (Test-Path $f) { $txt += (Get-Content $f -Raw -ErrorAction SilentlyContinue) } }
+                $m = [regex]::Match($txt, 'https://(?!api\.)[a-z0-9-]+\.trycloudflare\.com')
+                if ($m.Success) { $seen = $m.Value; if ($txt -match 'Registered tunnel connection') { break } }
+              }
+              if ($seen) { $r.url = $seen + '/'; Write-Host 'Terminal web siap.' } else { Write-Host 'Terminal web: cloudflared tidak mendapat URL.' }
+            } catch { Write-Host "Terminal web gagal: $($_.Exception.Message)" }
+            return $r
+          }
+          $web = Start-WebTerm $null
+          $webUrl = $web.url
+
+          # Port publik (Pro/Max): quick tunnel cloudflared ke http://localhost:<port>. Tanpa login: siapa pun yang punya link bisa membuka (demo, webhook, bot).
+          # Aplikasi di port itu boleh belum jalan saat link dibuat (sementara dijawab 502). Gagal di sini tidak menghentikan sesi. URL tidak dicetak ke log.
+          function Start-PubPort($old) {
+            $r = @{ url = ''; cf = $null }
+            if ($ppPort -le 0) { return $r }
+            try {
+              if ($old -and $old.cf) { Stop-Process -Id $old.cf.Id -Force -ErrorAction SilentlyContinue; Start-Sleep -Seconds 1 }
+              $po = Join-Path $work 'pp.out'; $pe = Join-Path $work 'pp.err'
+              Remove-Item $po, $pe -Force -ErrorAction SilentlyContinue
+              $r.cf = Start-Process -FilePath '/usr/local/bin/cloudflared' -ArgumentList @('tunnel', '--no-autoupdate', '--protocol', 'http2', '--url', "http://localhost:$ppPort") -RedirectStandardOutput $po -RedirectStandardError $pe -PassThru -NoNewWindow
+              $seen = ''
+              for ($i = 0; $i -lt 45; $i++) {
+                Start-Sleep -Seconds 1
+                if ($r.cf.HasExited) { break }
+                $txt = ''
+                foreach ($f in @($po, $pe)) { if (Test-Path $f) { $txt += (Get-Content $f -Raw -ErrorAction SilentlyContinue) } }
+                $m = [regex]::Match($txt, 'https://(?!api\.)[a-z0-9-]+\.trycloudflare\.com')
+                if ($m.Success) { $seen = $m.Value; if ($txt -match 'Registered tunnel connection') { break } }
+              }
+              if ($seen) { $r.url = $seen + '/'; Write-Host "Port publik siap (localhost:$ppPort)." } else { Write-Host 'Port publik: cloudflared tidak mendapat URL.' }
+            } catch { Write-Host "Port publik gagal: $($_.Exception.Message)" }
+            return $r
+          }
+          $pub = Start-PubPort $null
+          $pubUrl = $pub.url
+
+          $end = [DateTimeOffset]::UtcNow.AddMinutes($minutes)
+          $endStr = $end.ToString('o')
+          Publish-Session -Addr $t.host -Port $t.port -Expires $endStr
+          Write-Host "Sesi siap: $($t.host):$($t.port) sampai $endStr"
+
+          $idleMin = 0; if ($env:IDLE -match '^\d{1,3}$') { $idleMin = [int]$env:IDLE }
+          $lastSeen = [DateTimeOffset]::UtcNow
+          function Get-RdpClients {
+            try {
+              if ($IsWindows) { return @(Get-NetTCPConnection -LocalPort $svcPort -State Established -ErrorAction SilentlyContinue).Count }
+              $o = & ss -Htn state established "( sport = :$svcPort or sport = :$webPort or sport = :$pubPort )" 2>$null
+              return @($o | Where-Object { $_ -and $_.Trim() }).Count
+            } catch { return 1 }
+          }
+          function Test-StopRequest {
+            try { gh api "repos/$($env:GITHUB_REPOSITORY)/contents/.runova/$($env:SID).stop" --jq .sha 2>$null | Out-Null; return ($LASTEXITCODE -eq 0) } catch { return $false }
+          }
+          if ($idleMin -gt 0) { Write-Host "Hentikan otomatis aktif: $idleMin menit tanpa koneksi." }
+          $restarts = 0
+          $nextSync = [DateTimeOffset]::UtcNow.AddMinutes(5)
+          $nextProf = [DateTimeOffset]::UtcNow.AddMinutes(15)
+          $nextState = [DateTimeOffset]::UtcNow.AddMinutes(30)
+          $gen = -1; if ($env:CHAIN -match '^\d$') { $gen = [int]$env:CHAIN }
+          $handoff = ($gen -ge 0 -and $gen -lt 3 -and $minutes -ge 40)
+          $handAt = $end.AddMinutes(-14)
+          # Notifikasi Telegram + perpanjang (hanya kalau tiket ada dan bukan sesi yang menyambung sendiri)
+          $tgOn = (-not [string]::IsNullOrWhiteSpace($env:TG_TICKET)) -and (-not [string]::IsNullOrWhiteSpace($env:DRIVE_API)) -and (-not $handoff)
+          $capEnd = $end
+          try { $capEnd = [DateTimeOffset]::Parse($env:RUN_STARTED, [Globalization.CultureInfo]::InvariantCulture).ToUniversalTime().AddMinutes(340) } catch { }
+          $warnAt = $end.AddMinutes(-15)
+          $warned = $false
+          # Perlindungan penyalahgunaan: cari proses penambang kripto, matikan, hentikan sesi, lapor ke Runovacloud (akun diblokir).
+          $abOn = (-not [string]::IsNullOrWhiteSpace($env:AB_TICKET)) -and (-not [string]::IsNullOrWhiteSpace($env:DRIVE_API))
+          $abNames = @('xmrig','xmrig-notls','xmrig-cuda','xmr-stak','xmr-stak-cpu','minerd','cpuminer','cpuminer-opt','cpuminer-sse2','cpuminer-avx','cpuminer-avx2','ethminer','nbminer','t-rex','lolminer','phoenixminer','gminer','teamredminer','nanominer','bzminer','srbminer','srbminer-multi','cgminer','bfgminer','ccminer','wildrig','wildrig-multi','kawpowminer','minergate-cli','nicehashminer')
+          $abSkip = @('pwsh','powershell','bash','sh','dash','zsh','sudo','gh','git','grep','egrep','less','more','cat','tail','head','vim','nano','vi','notepad','ps','ss','chrome','chromium','firefox','firefox-bin','msedge','brave','brave-browser','iexplore')
+          $abCmd = 'stratum2?\+(tcp|ssl)|--donate-(level|over-proxy)|--algo[= ](rx/|randomx|cn/|cryptonight|kawpow|ethash|etchash|autolykos2|kheavyhash)|(supportxmr|minexmr|nanopool|2miners|f2pool|ethermine|moneroocean|hashvault|unmineable|herominers|c3pool|miningpoolhub|nicehash|kryptex|minergate|xmrpool)\.(com|org|net|io|stream|to|cc|pro|eu|xyz|network)'
+          $nextScan = [DateTimeOffset]::UtcNow.AddSeconds(30)
+          $nextBan = [DateTimeOffset]::UtcNow.AddMinutes(1)
+          function Get-ProcList {
+            if ($IsWindows) {
+              Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | ForEach-Object { [pscustomobject]@{ id = [int]$_.ProcessId; name = (([string]$_.Name) -replace '\.exe$', ''); cmd = [string]$_.CommandLine } }
+            } else {
+              & ps -eo 'pid=,comm=,args=' 2>$null | ForEach-Object { if ($_ -match '^\s*(\d+)\s+(\S+)\s+(.*)$') { [pscustomobject]@{ id = [int]$Matches[1]; name = $Matches[2]; cmd = $Matches[3] } } }
+            }
+          }
+          function Find-Abuse {
+            try {
+              foreach ($p in @(Get-ProcList)) {
+                if ($p.id -eq $PID) { continue }
+                $n = ([string]$p.name).ToLowerInvariant()
+                if ($abNames -contains $n) { return @{ why = "proses penambang kripto: $n"; id = $p.id } }
+                if ($abSkip -contains $n) { continue }
+                $c = [string]$p.cmd
+                if ($c -and ($c -match $abCmd)) { return @{ why = "perintah penambang kripto (pool/stratum): $n"; id = $p.id } }
+              }
+            } catch { }
+            return $null
+          }
+          function Send-Abuse([string]$Kind, [string]$Why = '') {
+            if (-not $abOn) { return $null }
+            try {
+              $b = @{ ticket = $env:AB_TICKET; sid = $env:SID; kind = $Kind; why = $Why; os = $env:RLABEL }
+              return Invoke-RestMethod -Method Post -Uri ($env:DRIVE_API.TrimEnd('/') + '/api/abuse') -ContentType 'application/json' -Body ($b | ConvertTo-Json -Compress) -TimeoutSec 20
+            } catch { return $null }
+          }
+          function Test-Banned { $r = Send-Abuse 'check'; return ($null -ne $r -and $r.banned -eq $true) }
+          function Stop-Abuse([string]$Why, [int]$ProcId, [bool]$Report) {
+            Write-Host "PELANGGARAN KEBIJAKAN PENGGUNAAN: $Why. Sesi dihentikan."
+            try {
+              if ($ProcId -gt 0) {
+                if ($IsWindows) { Stop-Process -Id $ProcId -Force -ErrorAction SilentlyContinue } else { & sudo kill -9 $ProcId 2>$null }
+              }
+            } catch { }
+            foreach ($v in @('RC_SYNC', 'RC_PROF', 'RC_STATE')) { "$v=0" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8 }
+            if ($Report) { Send-Abuse 'report' $Why | Out-Null }
+            try { Publish-Session -Addr $t.host -Port $t.port -Expires $endStr -Status 'stopping' } catch { }
+          }
+          function Send-Tg([string]$Kind, [hashtable]$Extra = @{}) {
+            if (-not $tgOn) { return }
+            try {
+              $b = @{ ticket = $env:TG_TICKET; sid = $env:SID; repo = $env:GITHUB_REPOSITORY; kind = $Kind; end = $end.ToString('o'); os = $env:RLABEL; user = $env:RUSER }
+              foreach ($k in $Extra.Keys) { $b[$k] = $Extra[$k] }
+              Invoke-RestMethod -Method Post -Uri ($env:DRIVE_API.TrimEnd('/') + '/api/tg') -ContentType 'application/json' -Body ($b | ConvertTo-Json -Compress) -TimeoutSec 20 | Out-Null
+            } catch { Write-Host 'Notifikasi Telegram gagal dikirim.' }
+          }
+          function Get-ExtendRequest {
+            try {
+              $p = "repos/$($env:GITHUB_REPOSITORY)/contents/.runova/$($env:SID).extend"
+              $j = gh api $p 2>$null
+              if ($LASTEXITCODE -ne 0 -or -not $j) { return 0 }
+              $o = $j | ConvertFrom-Json
+              $m = [int]([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String(($o.content -replace '\s', ''))).Trim())
+              gh api -X DELETE $p -f message="runova extend $($env:SID)" -f sha=$o.sha 2>$null | Out-Null
+              if ($m -ge 5 -and $m -le 120) { return $m }
+            } catch { }
+            return 0
+          }
+          while ([DateTimeOffset]::UtcNow -lt $end) {
+            Start-Sleep -Seconds 20
+            if (Test-StopRequest) {
+              Write-Host 'Permintaan stop diterima. Menyimpan desktop lalu berhenti.'
+              try { Publish-Session -Addr $t.host -Port $t.port -Expires $endStr -Status 'stopping' } catch { Write-Host 'Gagal menandai sesi berhenti.' }
+              break
+            }
+            if ([DateTimeOffset]::UtcNow -ge $nextScan) {
+              $nextScan = [DateTimeOffset]::UtcNow.AddSeconds(40)
+              $hit = Find-Abuse
+              if ($hit) { Stop-Abuse -Why $hit.why -ProcId $hit.id -Report $true; $handoff = $false; break }
+              if ($abOn -and [DateTimeOffset]::UtcNow -ge $nextBan) {
+                $nextBan = [DateTimeOffset]::UtcNow.AddMinutes(5)
+                if (Test-Banned) { Stop-Abuse -Why 'akun diblokir oleh admin' -ProcId 0 -Report $false; $handoff = $false; break }
+              }
+            }
+            if ($idleMin -gt 0) {
+              if ((Get-RdpClients) -gt 0) { $lastSeen = [DateTimeOffset]::UtcNow }
+              elseif (([DateTimeOffset]::UtcNow - $lastSeen).TotalMinutes -ge $idleMin) {
+                Write-Host "Tidak ada koneksi selama $idleMin menit. Sesi dihentikan otomatis untuk menghemat kuota."
+                break
+              }
+            }
+            if ($tgOn -and [DateTimeOffset]::UtcNow -ge $warnAt) {
+              if (-not $warned) {
+                $warned = $true
+                $leftMin = [int][Math]::Max(1, [Math]::Round(($end - [DateTimeOffset]::UtcNow).TotalMinutes))
+                $roomMin = [int][Math]::Max(0, [Math]::Floor(($capEnd - $end).TotalMinutes))
+                Send-Tg 'warn' @{ left = $leftMin; cap = $roomMin }
+              }
+              $req = Get-ExtendRequest
+              if ($req -gt 0) {
+                $room = [int][Math]::Floor(($capEnd - $end).TotalMinutes)
+                $add = [Math]::Min($req, $room)
+                if ($add -lt 5) { Send-Tg 'denied' }
+                else {
+                  $end = $end.AddMinutes($add)
+                  $endStr = $end.ToString('o')
+                  try { Publish-Session -Addr $t.host -Port $t.port -Expires $endStr } catch { Write-Host 'Gagal memperbarui waktu sesi.' }
+                  $warnAt = $end.AddMinutes(-15)
+                  $warned = ($warnAt -le [DateTimeOffset]::UtcNow)
+                  Write-Host "Sesi diperpanjang $add menit sampai $endStr."
+                  Send-Tg 'extended' @{ added = $add; partial = ($add -lt $req) }
+                }
+              }
+            }
+            if ($env:RC_SYNC -eq '1' -and [DateTimeOffset]::UtcNow -ge $nextSync) {
+              try { & pwsh -NoProfile -File $env:RC_SYNC_SCRIPT up } catch { Write-Host 'Simpan otomatis gagal.' }
+              $nextSync = [DateTimeOffset]::UtcNow.AddMinutes(5)
+            }
+            if ($env:RC_PROF -eq '1' -and [DateTimeOffset]::UtcNow -ge $nextProf) {
+              try { & pwsh -NoProfile -File $env:RC_PROF_SCRIPT save } catch { Write-Host 'Simpan pengaturan gagal.' }
+              $nextProf = [DateTimeOffset]::UtcNow.AddMinutes(15)
+            }
+            if ($env:RC_STATE -eq '1' -and [DateTimeOffset]::UtcNow -ge $nextState) {
+              try { & pwsh -NoProfile -File $env:RC_STATE_SCRIPT save } catch { Write-Host 'Simpan state Pro gagal.' }
+              $nextState = [DateTimeOffset]::UtcNow.AddMinutes(30)
+            }
+            if ($handoff -and [DateTimeOffset]::UtcNow -ge $handAt) {
+              $handoff = $false
+              try {
+                if ($env:RC_STATE -eq '1') { & pwsh -NoProfile -File $env:RC_STATE_SCRIPT save }
+                $nsid = -join ((1..12) | ForEach-Object { '0123456789abcdef'[(Get-Random -Maximum 16)] })
+                $root = $env:SID; if ($env:ROOT_SID) { $root = $env:ROOT_SID }
+                gh workflow run rdp.yml --repo $env:GITHUB_REPOSITORY --ref $env:GITHUB_REF_NAME -f session_id=$nsid -f runner=$env:RLABEL -f username=$env:RUSER -f minutes=$env:MINUTES -f password=$env:RPW -f purpose=$env:PURPOSE -f save_settings=$env:SAVE_SETTINGS -f extra=$env:EXTRA -f chain=([string]($gen + 1)) -f root_sid=$root -f idle=$env:IDLE -f frp=$env:FRP -f tg_ticket=$env:TG_TICKET -f ab_ticket=$env:AB_TICKET
+                Write-Host "Sesi lanjutan dijalankan ($nsid). Sambung ulang ke alamat barunya."
+              } catch { Write-Host 'Gagal memulai sesi lanjutan.' }
+            }
+            if ($t.proc.HasExited -and $restarts -lt 10) {
+              $restarts++
+              Write-Host "Tunnel terputus, mencoba lagi ($restarts)."
+              $n = Start-Tunnel
+              if ($n) { $t = $n; Publish-Session -Addr $t.host -Port $t.port -Expires $endStr }
+            }
+            if ($env:RC_WEB -eq '1' -and $webRestarts -lt 5 -and (-not $web.ttyd -or $web.ttyd.HasExited -or $web.cf.HasExited)) {
+              $webRestarts++
+              Write-Host "Terminal web perlu dimulai ulang ($webRestarts)."
+              $web = Start-WebTerm $web
+              $webUrl = $web.url
+              try { Publish-Session -Addr $t.host -Port $t.port -Expires $endStr } catch { }
+            }
+            if ($ppPort -gt 0 -and $pubRestarts -lt 5 -and (-not $pub.cf -or $pub.cf.HasExited)) {
+              $pubRestarts++
+              Write-Host "Port publik perlu dimulai ulang ($pubRestarts)."
+              $pub = Start-PubPort $pub
+              $pubUrl = $pub.url
+              try { Publish-Session -Addr $t.host -Port $t.port -Expires $endStr } catch { }
+            }
+          }
+          if (-not $t.proc.HasExited) { Stop-Process -Id $t.proc.Id -Force -ErrorAction SilentlyContinue }
+          if ($env:RC_WEB -eq '1') { & sudo pkill -x cloudflared 2>$null; & sudo pkill -x ttyd 2>$null }
+          Write-Host 'Sesi berakhir.'
+          $global:LASTEXITCODE = 0
+
+      - name: Simpan terakhir ke Drive
+        if: always() && env.RC_SYNC == '1'
+        shell: pwsh
+        run: |
+          try { & pwsh -NoProfile -File $env:RC_SYNC_SCRIPT up; Write-Host 'Perubahan terakhir tersimpan ke Drive.' } catch { Write-Host 'Simpan terakhir gagal.' }
+          exit 0
+
+      - name: Simpan pengaturan desktop
+        if: always() && env.RC_PROF == '1'
+        shell: pwsh
+        run: |
+          try { & pwsh -NoProfile -File $env:RC_PROF_SCRIPT save } catch { Write-Host 'Simpan pengaturan gagal.' }
+          exit 0
+
+      - name: Simpan state Pro
+        if: always() && env.RC_STATE == '1'
+        shell: pwsh
+        run: |
+          $env:RC_FINAL = '1'
+          try { & pwsh -NoProfile -File $env:RC_STATE_SCRIPT save } catch { Write-Host 'Simpan state Pro gagal.' }
+          exit 0
+
+      - name: Membersihkan sesi
+        if: always()
+        shell: pwsh
+        run: |
+          if ($env:AB_TICKET -and $env:DRIVE_API) {
+            try { Invoke-RestMethod -Method Post -Uri ($env:DRIVE_API.TrimEnd('/') + '/api/abuse') -ContentType 'application/json' -Body (@{ ticket = $env:AB_TICKET; sid = $env:SID; kind = 'end' } | ConvertTo-Json -Compress) -TimeoutSec 20 | Out-Null } catch { }
+          }
+          $api = "repos/$($env:GITHUB_REPOSITORY)/contents/.runova/$($env:SID).json"
+          $sha = gh api $api --jq .sha 2>$null
+          if ($LASTEXITCODE -eq 0 -and $sha) { gh api -X DELETE $api -f message="runova end $($env:SID)" -f sha=$sha 2>$null | Out-Null }
+          $sa = "repos/$($env:GITHUB_REPOSITORY)/contents/.runova/$($env:SID).stop"
+          $ss = gh api $sa --jq .sha 2>$null
+          if ($LASTEXITCODE -eq 0 -and $ss) { gh api -X DELETE $sa -f message="runova end $($env:SID)" -f sha=$ss 2>$null | Out-Null }
+          $xa = "repos/$($env:GITHUB_REPOSITORY)/contents/.runova/$($env:SID).extend"
+          $xs = gh api $xa --jq .sha 2>$null
+          if ($LASTEXITCODE -eq 0 -and $xs) { gh api -X DELETE $xa -f message="runova end $($env:SID)" -f sha=$xs 2>$null | Out-Null }
+          $pa = "repos/$($env:GITHUB_REPOSITORY)/contents/.runova/$($env:SID).prog.json"
+          $ps = gh api $pa --jq .sha 2>$null
+          if ($LASTEXITCODE -eq 0 -and $ps) { gh api -X DELETE $pa -f message="runova end $($env:SID)" -f sha=$ps 2>$null | Out-Null }
+          exit 0
